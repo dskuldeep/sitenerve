@@ -1,0 +1,489 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum ProjectStatus {
+  INITIALIZING
+  CRAWLING
+  ACTIVE
+  PAUSED
+  ERROR
+}
+
+enum CrawlStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum IssueSeverity {
+  INFO
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IssueStatus {
+  ACTIVE
+  RESOLVED
+  WHITELISTED
+}
+
+enum IssueCategory {
+  INDEXABILITY
+  CRAWLABILITY
+  ON_PAGE
+  PERFORMANCE
+  STRUCTURED_DATA
+  IMAGES
+  LINKS
+  INTERNATIONALIZATION
+  CANONICALIZATION
+  SECURITY
+  MOBILE
+  SOCIAL
+}
+
+enum WhitelistScope {
+  SINGLE
+  RULE
+  URL_PATTERN
+}
+
+enum AgentRunStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+enum TriggerType {
+  POST_CRAWL
+  SCHEDULED
+  ON_NEW_ISSUES
+  ON_NEW_PAGES
+  MANUAL
+  WEBHOOK_INBOUND
+}
+
+enum NotificationType {
+  NEW_PAGE
+  PAGE_REMOVED
+  NEW_ISSUE
+  ISSUE_RESOLVED
+  ISSUE_REGRESSION
+  AGENT_FINDING
+  CRAWL_FAILED
+  CRAWL_COMPLETED
+  WEBHOOK_FAILED
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  passwordHash  String?
+  name          String?
+  avatarUrl     String?
+  role          UserRole  @default(OWNER)
+  emailVerified DateTime?
+  geminiApiKey  String?
+  geminiModel   String    @default("gemini-2.5-flash")
+  temperature   Float     @default(0.2)
+  tokenBudget   Int?
+  webhookUrl    String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  projects      Project[]
+  notifications Notification[]
+  whitelistEntries WhitelistEntry[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Project {
+  id             String        @id @default(cuid())
+  userId         String
+  name           String
+  siteUrl        String
+  sitemapUrl     String?
+  description    String?
+  status         ProjectStatus @default(INITIALIZING)
+  crawlSchedule  String        @default("0 2 * * *")
+  lastCrawlAt    DateTime?
+  healthScore    Float         @default(100)
+  totalPages     Int           @default(0)
+  maxCrawlPages  Int           @default(5000)
+  totalIssues    Int           @default(0)
+  webhookUrl     String?
+  webhookHeaders Json?
+  webhookSecret  String?
+  webhookRetries Int           @default(3)
+  webhookTimeout Int           @default(30)
+  webhookEvents  Json?
+  qualificationPrompt String?  @db.Text
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pages          Page[]
+  crawls         Crawl[]
+  issues         Issue[]
+  whitelistEntries WhitelistEntry[]
+  agents         Agent[]
+  graphNodes     GraphNode[]
+  graphEdges     GraphEdge[]
+  notifications  Notification[]
+  qualificationRuns QualificationRun[]
+  webhookDeliveries WebhookDelivery[]
+
+  @@unique([userId, siteUrl])
+}
+
+model Page {
+  id               String   @id @default(cuid())
+  projectId        String
+  url              String
+  canonicalUrl     String?
+  statusCode       Int?
+  responseTime     Float?
+  title            String?
+  metaDescription  String?
+  metaRobots       String?
+  h1               String[]
+  h2               String[]
+  h3               String[]
+  h4               String[]
+  h5               String[]
+  h6               String[]
+  ogTags           Json?
+  jsonLd           Json?
+  internalLinks    Json?
+  externalLinks    Json?
+  images           Json?
+  wordCount        Int?
+  hreflangTags     Json?
+  pageSize         Int?
+  coreWebVitals    Json?
+  depth            Int      @default(0)
+  lastCrawledAt    DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  project    Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  issues     Issue[]
+  keywords   PageKeyword[]
+  graphNode  GraphNode?
+  crawlPages CrawlPage[]
+
+  @@unique([projectId, url])
+  @@index([projectId])
+}
+
+model Crawl {
+  id            String      @id @default(cuid())
+  projectId     String
+  status        CrawlStatus @default(QUEUED)
+  startedAt     DateTime?
+  completedAt   DateTime?
+  totalPages    Int         @default(0)
+  newPages      Int         @default(0)
+  removedPages  Int         @default(0)
+  changedPages  Int         @default(0)
+  errorCount    Int         @default(0)
+  errorMessage  String?
+  diff          Json?
+  createdAt     DateTime    @default(now())
+
+  project    Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  crawlPages CrawlPage[]
+
+  @@index([projectId, createdAt(sort: Desc)])
+}
+
+model CrawlPage {
+  id       String @id @default(cuid())
+  crawlId  String
+  pageId   String
+
+  crawl Crawl @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+  page  Page  @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@unique([crawlId, pageId])
+}
+
+model Issue {
+  id              String        @id @default(cuid())
+  projectId       String
+  pageId          String?
+  ruleId          String
+  category        IssueCategory
+  severity        IssueSeverity
+  title           String
+  description     String        @db.Text
+  affectedUrl     String
+  evidence        Json?
+  isWhitelisted   Boolean       @default(false)
+  whitelistReason String?
+  status          IssueStatus   @default(ACTIVE)
+  firstDetectedAt DateTime      @default(now())
+  lastDetectedAt  DateTime      @default(now())
+  resolvedAt      DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  page    Page?   @relation(fields: [pageId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, status])
+  @@index([projectId, severity])
+  @@index([projectId, category])
+  @@index([ruleId])
+}
+
+model WhitelistEntry {
+  id         String         @id @default(cuid())
+  projectId  String
+  scope      WhitelistScope
+  issueId    String?
+  ruleId     String?
+  urlPattern String?
+  reason     String
+  createdBy  String
+  expiresAt  DateTime?
+  createdAt  DateTime       @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [createdBy], references: [id])
+
+  @@index([projectId])
+}
+
+model Agent {
+  id            String     @id @default(cuid())
+  projectId     String
+  name          String
+  description   String?
+  prompt        String     @db.Text
+  seedPrompt    String     @db.Text
+  triggerType   TriggerType @default(MANUAL)
+  triggerConfig Json?
+  skills        Json       @default("[]")
+  geminiModel   String?
+  webhookEnabled Boolean   @default(false)
+  webhookUrl    String?
+  isActive      Boolean    @default(true)
+  lastRunAt     DateTime?
+  lastRunStatus AgentRunStatus?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  project  Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  runs     AgentRun[]
+
+  @@index([projectId, isActive])
+}
+
+model AgentRun {
+  id            String         @id @default(cuid())
+  agentId       String
+  status        AgentRunStatus @default(SUCCESS)
+  startedAt     DateTime       @default(now())
+  completedAt   DateTime?
+  duration      Int?
+  tokensUsed    Int?
+  modelUsed     String?
+  rawOutput     String?        @db.Text
+  errorMessage  String?
+  createdAt     DateTime       @default(now())
+
+  agent    Agent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  findings AgentFinding[]
+
+  @@index([agentId, createdAt(sort: Desc)])
+}
+
+model AgentFinding {
+  id           String        @id @default(cuid())
+  agentRunId   String
+  type         String
+  title        String
+  severity     IssueSeverity
+  description  String        @db.Text
+  affectedUrls Json          @default("[]")
+  remediation  String?       @db.Text
+  confidence   Float?
+  source       String?
+  createdAt    DateTime      @default(now())
+
+  agentRun AgentRun @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+
+  @@index([agentRunId])
+}
+
+model QualificationRun {
+  id              String   @id @default(cuid())
+  projectId       String
+  crawlId         String?
+  agentRunIds     Json     @default("[]")
+  status          String   @default("PENDING")
+  output          Json?
+  executiveSummary String? @db.Text
+  healthScore     Float?
+  healthScoreDelta Float?
+  tokensUsed      Int?
+  modelUsed       String?
+  errorMessage    String?
+  startedAt       DateTime @default(now())
+  completedAt     DateTime?
+  createdAt       DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt(sort: Desc)])
+}
+
+model WebhookDelivery {
+  id             String   @id @default(cuid())
+  projectId      String
+  event          String
+  payload        Json
+  url            String
+  statusCode     Int?
+  responseBody   String?  @db.Text
+  attempt        Int      @default(1)
+  maxAttempts    Int      @default(3)
+  success        Boolean  @default(false)
+  errorMessage   String?
+  deliveredAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, createdAt(sort: Desc)])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  projectId String
+  type      NotificationType
+  severity  IssueSeverity    @default(INFO)
+  title     String
+  body      String
+  metadata  Json?
+  isRead    Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@index([projectId, createdAt(sort: Desc)])
+}
+
+model GraphNode {
+  id          String  @id @default(cuid())
+  projectId   String
+  pageId      String  @unique
+  url         String
+  label       String
+  group       String?
+  depth       Int     @default(0)
+  issueCount  Int     @default(0)
+  inboundLinks Int    @default(0)
+  status      String  @default("healthy")
+  isNew       Boolean @default(false)
+  isRemoved   Boolean @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project       Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  page          Page        @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  outgoingEdges GraphEdge[] @relation("SourceNode")
+  incomingEdges GraphEdge[] @relation("TargetNode")
+
+  @@index([projectId])
+}
+
+model GraphEdge {
+  id           String @id @default(cuid())
+  projectId    String
+  sourceNodeId String
+  targetNodeId String
+  anchorText   String?
+  isNew        Boolean @default(false)
+  createdAt    DateTime @default(now())
+
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sourceNode GraphNode @relation("SourceNode", fields: [sourceNodeId], references: [id], onDelete: Cascade)
+  targetNode GraphNode @relation("TargetNode", fields: [targetNodeId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, sourceNodeId, targetNodeId])
+  @@index([projectId])
+}
+
+model PageKeyword {
+  id        String @id @default(cuid())
+  pageId    String
+  keyword   String
+  score     Float
+  frequency Int    @default(1)
+  sources   Json   @default("[]")
+  createdAt DateTime @default(now())
+
+  page Page @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@index([pageId])
+  @@index([keyword])
+}
