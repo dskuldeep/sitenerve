@@ -72,15 +72,45 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       : []),
   ],
   callbacks: {
-    async jwt({ token, user }) {
+    async jwt({ token, user, trigger, session }) {
       if (user) {
         token.id = user.id;
+        token.name = user.name;
+        token.email = user.email;
+        token.picture = user.image;
       }
+
+      if (token.id && trigger === "update") {
+        const sessionUpdate = session as { name?: string | null; image?: string | null } | undefined;
+
+        if (sessionUpdate && ("name" in sessionUpdate || "image" in sessionUpdate)) {
+          if (sessionUpdate.name !== undefined) token.name = sessionUpdate.name;
+          if (sessionUpdate.image !== undefined) token.picture = sessionUpdate.image;
+        } else {
+          const latestUser = await prisma.user.findUnique({
+            where: { id: token.id as string },
+            select: { name: true, email: true, avatarUrl: true },
+          });
+
+          if (latestUser) {
+            token.name = latestUser.name;
+            token.email = latestUser.email;
+            token.picture = latestUser.avatarUrl;
+          }
+        }
+      }
+
       return token;
     },
     async session({ session, token }) {
       if (session.user && token.id) {
         session.user.id = token.id as string;
+        session.user.name = typeof token.name === "string" ? token.name : session.user.name;
+        session.user.email = typeof token.email === "string" ? token.email : session.user.email;
+        session.user.image =
+          typeof token.picture === "string" || token.picture === null
+            ? (token.picture as string | null)
+            : session.user.image;
       }
       return session;
     },

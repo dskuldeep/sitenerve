@@ -52,6 +52,7 @@ interface AgentDetail {
   isActive: boolean;
   lastRunAt: string | null;
   lastRunStatus: string | null;
+  nextScheduledAt: string | null;
   runs: Array<{
     id: string;
     status: string;
@@ -75,6 +76,7 @@ interface AgentDraft {
   name: string;
   prompt: string;
   triggerType: string;
+  scheduleCron: string;
   geminiModel: string;
   webhookEnabled: boolean;
   webhookUrl: string;
@@ -86,6 +88,12 @@ function toDraft(agent: AgentDetail): AgentDraft {
     name: agent.name,
     prompt: agent.prompt,
     triggerType: agent.triggerType,
+    scheduleCron:
+      typeof agent.triggerConfig?.cron === "string"
+        ? agent.triggerConfig.cron
+        : typeof agent.triggerConfig?.schedule === "string"
+          ? agent.triggerConfig.schedule
+          : "0 2 * * *",
     geminiModel: agent.geminiModel || "",
     webhookEnabled: agent.webhookEnabled,
     webhookUrl: agent.webhookUrl || "",
@@ -132,8 +140,9 @@ export default function AgentDetailPage() {
 
   const saveAgent = useMutation({
     mutationFn: async () => {
+      const currentAgent = agent;
       const payload = draft || (agent ? toDraft(agent) : null);
-      if (!payload) {
+      if (!payload || !currentAgent) {
         throw new Error("Agent not loaded");
       }
 
@@ -144,6 +153,10 @@ export default function AgentDetailPage() {
           name: payload.name,
           prompt: payload.prompt,
           triggerType: payload.triggerType,
+          triggerConfig:
+            payload.triggerType === "SCHEDULED"
+              ? { ...(currentAgent.triggerConfig || {}), cron: payload.scheduleCron.trim() }
+              : undefined,
           geminiModel: payload.geminiModel || null,
           webhookEnabled: payload.webhookEnabled,
           webhookUrl: payload.webhookEnabled ? payload.webhookUrl || null : null,
@@ -213,15 +226,24 @@ export default function AgentDetailPage() {
   if (!agent) return null;
 
   const form = draft || toDraft(agent);
+  const persistedScheduleCron =
+    typeof agent.triggerConfig?.cron === "string"
+      ? agent.triggerConfig.cron
+      : typeof agent.triggerConfig?.schedule === "string"
+        ? agent.triggerConfig.schedule
+        : "0 2 * * *";
   const hasChanges =
     form.prompt !== agent.prompt ||
     form.name !== agent.name ||
     form.triggerType !== agent.triggerType ||
+    form.scheduleCron !== persistedScheduleCron ||
     form.geminiModel !== (agent.geminiModel || "") ||
     form.webhookEnabled !== agent.webhookEnabled ||
     form.webhookUrl !== (agent.webhookUrl || "") ||
     form.isActive !== agent.isActive;
   const webhookConfigValid = !form.webhookEnabled || Boolean(form.webhookUrl.trim());
+  const scheduleConfigValid =
+    form.triggerType !== "SCHEDULED" || Boolean(form.scheduleCron.trim());
 
   return (
     <div className="space-y-6">
@@ -255,7 +277,12 @@ export default function AgentDetailPage() {
             {runAgent.isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Play className="h-3 w-3 mr-1" />}
             Test Run
           </Button>
-          <Button size="sm" onClick={() => saveAgent.mutate()} disabled={!hasChanges || saveAgent.isPending || !webhookConfigValid}
+          <Button
+            size="sm"
+            onClick={() => saveAgent.mutate()}
+            disabled={
+              !hasChanges || saveAgent.isPending || !webhookConfigValid || !scheduleConfigValid
+            }
             className="bg-blue-600 hover:bg-blue-700 text-white">
             {saveAgent.isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Save className="h-3 w-3 mr-1" />}
             Save
@@ -317,6 +344,57 @@ export default function AgentDetailPage() {
                   ))}
                 </SelectContent>
               </Select>
+              {form.triggerType === "SCHEDULED" && (
+                <div className="space-y-2">
+                  <Label className="text-xs text-[#94A3B8]">Schedule Cron</Label>
+                  <Input
+                    value={form.scheduleCron}
+                    onChange={(event) =>
+                      setDraft((prev) => ({
+                        ...(prev || toDraft(agent)),
+                        scheduleCron: event.target.value,
+                      }))
+                    }
+                    placeholder="0 2 * * *"
+                    className="bg-[#1E293B] border-[#334155] text-[#F8FAFC] placeholder:text-[#64748B]"
+                  />
+                  <p className="text-[11px] text-[#64748B]">
+                    Example: <code>0 2 * * *</code> runs daily at 02:00 UTC.
+                  </p>
+                  <div className="grid grid-cols-1 gap-2 pt-1">
+                    <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-[#64748B]">
+                        Scheduler status
+                      </p>
+                      <p className="mt-1 text-xs text-[#F8FAFC]">
+                        {form.isActive ? "Enabled" : "Agent disabled"}
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-[#64748B]">
+                        Next run
+                      </p>
+                      <p className="mt-1 text-xs text-cyan-400">
+                        {agent.nextScheduledAt
+                          ? formatDistanceToNow(new Date(agent.nextScheduledAt), {
+                              addSuffix: true,
+                            })
+                          : "Will appear after save"}
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                      <p className="text-[10px] uppercase tracking-wide text-[#64748B]">
+                        Last run
+                      </p>
+                      <p className="mt-1 text-xs text-[#F8FAFC]">
+                        {agent.lastRunAt
+                          ? formatDistanceToNow(new Date(agent.lastRunAt), { addSuffix: true })
+                          : "Never run"}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
 

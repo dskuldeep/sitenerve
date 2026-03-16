@@ -1,4 +1,4 @@
-import { Worker } from "bullmq";
+import { Queue, Worker } from "bullmq";
 import type { ConnectionOptions } from "bullmq";
 import IORedis from "ioredis";
 import { Prisma } from "@prisma/client";
@@ -8,6 +8,8 @@ const connection = new IORedis(process.env.REDIS_URL || "redis://localhost:6379"
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
 }) as unknown as ConnectionOptions;
+const postCrawlQueue = new Queue("post-crawl-queue", { connection });
+const staleJobRecoveryThresholdMs = 5 * 60 * 1000;
 
 type PostProcessingPatch = Record<string, unknown>;
 
@@ -32,6 +34,51 @@ function mergePostProcessingIntoDiff(
       ...patch,
     },
   } as Prisma.InputJsonValue;
+}
+
+async function recoverStaleActivePostCrawlJobs(): Promise<void> {
+  try {
+    const activeJobs = await postCrawlQueue.getJobs(["active"]);
+    if (activeJobs.length === 0) return;
+
+    const rawRedis = connection as unknown as IORedis;
+    const now = Date.now();
+
+    for (const job of activeJobs) {
+      const processedOn = job.processedOn ?? 0;
+      if (processedOn === 0 || now - processedOn < staleJobRecoveryThresholdMs) {
+        continue;
+      }
+
+      const lockKey = `bull:post-crawl-queue:${job.id}:lock`;
+      const lockTtlMs = await rawRedis.pttl(lockKey);
+
+      if (lockTtlMs > 0) {
+        await rawRedis.del(lockKey);
+      }
+
+      const attempts =
+        typeof job.opts.attempts === "number" && job.opts.attempts > 0 ? job.opts.attempts : 3;
+      const backoff = job.opts.backoff ?? { type: "exponential" as const, delay: 5000 };
+
+      await job.remove();
+      await postCrawlQueue.add(job.name, job.data, {
+        jobId: String(job.id),
+        attempts,
+        backoff,
+        removeOnComplete: job.opts.removeOnComplete,
+        removeOnFail: job.opts.removeOnFail,
+      });
+
+      console.warn(
+        `[Post-Crawl Worker] Recovered stale active job ${job.id} after ${Math.round(
+          (now - processedOn) / 1000
+        )}s`
+      );
+    }
+  } catch (error) {
+    console.error("[Post-Crawl Worker] Failed to recover stale active jobs:", error);
+  }
 }
 
 const postCrawlWorker = new Worker(
@@ -92,7 +139,14 @@ const postCrawlWorker = new Worker(
     });
 
     const stepStatus: Record<string, { status: "SUCCESS" | "FAILED"; error?: string }> = {};
-    let auditResult: { issueCount: number; healthScore: number } | null = null;
+    let auditResult:
+      | {
+          issueCount: number;
+          healthScore: number;
+          previousHealthScore: number | null;
+          activeIssueCount: number;
+        }
+      | null = null;
 
     try {
       try {
@@ -130,8 +184,14 @@ const postCrawlWorker = new Worker(
 
       try {
         console.log(`[Post-Crawl Worker] Evaluating agent triggers for project ${projectId}`);
-        const { evaluatePostCrawlTriggers } = await import("@/services/agents/trigger-evaluator");
+        const {
+          evaluatePostCrawlTriggers,
+          evaluateOnNewIssuesTriggers,
+          evaluateOnNewPagesTriggers,
+        } = await import("@/services/agents/trigger-evaluator");
         await evaluatePostCrawlTriggers(projectId, crawlId);
+        await evaluateOnNewIssuesTriggers(projectId, auditResult?.issueCount ?? 0);
+        await evaluateOnNewPagesTriggers(projectId, crawl.newPages);
         stepStatus.agents = { status: "SUCCESS" };
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown trigger error";
@@ -140,7 +200,7 @@ const postCrawlWorker = new Worker(
       }
 
       try {
-        console.log(`[Post-Crawl Worker] Sending crawl-completed webhook for project ${projectId}`);
+        console.log(`[Post-Crawl Worker] Sending project webhook events for project ${projectId}`);
         const { enqueueWebhookIfConfigured } = await import("@/services/webhooks/event-emitter");
         await enqueueWebhookIfConfigured(projectId, "crawl.completed", {
           crawlId,
@@ -152,6 +212,37 @@ const postCrawlWorker = new Worker(
           healthScore: auditResult?.healthScore ?? null,
           newIssueCount: auditResult?.issueCount ?? null,
         });
+
+        if (auditResult) {
+          await enqueueWebhookIfConfigured(projectId, "audit.completed", {
+            crawlId,
+            healthScore: auditResult.healthScore,
+            previousHealthScore: auditResult.previousHealthScore,
+            activeIssueCount: auditResult.activeIssueCount,
+            newIssueCount: auditResult.issueCount,
+          });
+
+          if (auditResult.issueCount > 0) {
+            await enqueueWebhookIfConfigured(projectId, "issues.new", {
+              crawlId,
+              newIssueCount: auditResult.issueCount,
+              activeIssueCount: auditResult.activeIssueCount,
+              healthScore: auditResult.healthScore,
+            });
+          }
+
+          if (
+            auditResult.previousHealthScore !== null &&
+            auditResult.previousHealthScore !== auditResult.healthScore
+          ) {
+            await enqueueWebhookIfConfigured(projectId, "health.changed", {
+              crawlId,
+              previousHealthScore: auditResult.previousHealthScore,
+              healthScore: auditResult.healthScore,
+              delta: auditResult.healthScore - auditResult.previousHealthScore,
+            });
+          }
+        }
         stepStatus.webhook = { status: "SUCCESS" };
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown webhook error";
@@ -200,6 +291,8 @@ const postCrawlWorker = new Worker(
     removeOnFail: { count: 50 },
   }
 );
+
+void recoverStaleActivePostCrawlJobs();
 
 postCrawlWorker.on("completed", (job) => {
   console.log(`[Post-Crawl Worker] Job ${job.id} completed`);

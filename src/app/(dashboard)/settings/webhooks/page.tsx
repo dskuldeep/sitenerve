@@ -14,9 +14,6 @@ import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import {
   Card,
-  CardHeader,
-  CardTitle,
-  CardDescription,
   CardContent,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -25,7 +22,7 @@ import { Separator } from "@/components/ui/separator";
 interface Project {
   id: string;
   name: string;
-  url: string;
+  siteUrl: string;
 }
 
 export default function WebhooksPage() {
@@ -38,8 +35,8 @@ export default function WebhooksPage() {
         const res = await fetch("/api/projects");
         if (!res.ok) throw new Error("Failed to fetch projects");
         const data = await res.json();
-        setProjects(Array.isArray(data) ? data : data.projects || []);
-      } catch (error) {
+        setProjects(Array.isArray(data) ? data : data.data || []);
+      } catch {
         toast.error("Failed to load projects");
       } finally {
         setLoading(false);
@@ -111,7 +108,7 @@ export default function WebhooksPage() {
                           {project.name}
                         </p>
                         <p className="text-xs text-[#64748B] truncate">
-                          {project.url}
+                          {project.siteUrl}
                         </p>
                       </div>
                     </div>

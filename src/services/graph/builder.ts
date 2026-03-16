@@ -2,6 +2,8 @@ import { prisma } from "@/lib/prisma";
 import { normalizeComparableUrl as normalizeComparableSiteUrl } from "@/lib/url-normalization";
 import type { GraphAnalytics } from "@/types/graph";
 
+const GRAPH_CREATE_BATCH_SIZE = 500;
+
 const STOPWORDS = new Set([
   "a",
   "an",
@@ -155,10 +157,27 @@ function extractStoredLinks(raw: unknown): StoredLink[] {
   return links;
 }
 
+function chunkArray<T>(items: T[], size: number): T[][] {
+  if (items.length === 0) return [];
+
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
 export async function buildGraph(projectId: string): Promise<void> {
   const pages = await prisma.page.findMany({
     where: { projectId },
-    include: {
+    select: {
+      id: true,
+      url: true,
+      internalLinks: true,
+      externalLinks: true,
+      statusCode: true,
+      depth: true,
       issues: {
         where: { status: "ACTIVE" },
         select: { severity: true },
@@ -206,8 +225,17 @@ export async function buildGraph(projectId: string): Promise<void> {
   await prisma.graphEdge.deleteMany({ where: { projectId } });
   await prisma.graphNode.deleteMany({ where: { projectId } });
 
-  const nodeMap = new Map<string, string>();
-
+  const nodeRows: Array<{
+    projectId: string;
+    pageId: string;
+    url: string;
+    label: string;
+    group: string;
+    depth: number;
+    issueCount: number;
+    inboundLinks: number;
+    status: string;
+  }> = [];
   for (const page of pages) {
     const urlObj = new URL(page.url);
     const pathParts = urlObj.pathname.split("/").filter(Boolean);
@@ -226,21 +254,37 @@ export async function buildGraph(projectId: string): Promise<void> {
       status = "low";
     }
 
-    const node = await prisma.graphNode.create({
-      data: {
-        projectId,
-        pageId: page.id,
-        url: page.url,
-        label,
-        group,
-        depth: page.depth,
-        issueCount: page.issues.length,
-        inboundLinks,
-        status,
-      },
+    nodeRows.push({
+      projectId,
+      pageId: page.id,
+      url: page.url,
+      label,
+      group,
+      depth: page.depth,
+      issueCount: page.issues.length,
+      inboundLinks,
+      status,
     });
+  }
 
-    nodeMap.set(normalizeComparableSiteUrl(page.url), node.id);
+  for (const chunk of chunkArray(nodeRows, GRAPH_CREATE_BATCH_SIZE)) {
+    await prisma.graphNode.createMany({
+      data: chunk,
+      skipDuplicates: true,
+    });
+  }
+
+  const createdNodes = await prisma.graphNode.findMany({
+    where: { projectId },
+    select: {
+      id: true,
+      url: true,
+    },
+  });
+
+  const nodeMap = new Map<string, string>();
+  for (const node of createdNodes) {
+    nodeMap.set(normalizeComparableSiteUrl(node.url), node.id);
   }
 
   const edgeRows: Array<{
@@ -268,10 +312,12 @@ export async function buildGraph(projectId: string): Promise<void> {
   }
 
   if (edgeRows.length > 0) {
-    await prisma.graphEdge.createMany({
-      data: edgeRows,
-      skipDuplicates: true,
-    });
+    for (const chunk of chunkArray(edgeRows, GRAPH_CREATE_BATCH_SIZE)) {
+      await prisma.graphEdge.createMany({
+        data: chunk,
+        skipDuplicates: true,
+      });
+    }
   }
 }
 

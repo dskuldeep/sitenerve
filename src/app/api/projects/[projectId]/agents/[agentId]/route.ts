@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { getNextScheduledAt, isValidCronExpression } from "@/lib/scheduler";
 import { z } from "zod";
 
 const updateAgentSchema = z.object({
@@ -23,6 +24,17 @@ const updateAgentSchema = z.object({
   webhookUrl: z.string().url().nullable().optional(),
   isActive: z.boolean().optional(),
 });
+
+function getScheduledCron(triggerConfig: Record<string, unknown> | undefined): string | null {
+  if (!triggerConfig) return null;
+  const cron =
+    typeof triggerConfig.cron === "string"
+      ? triggerConfig.cron.trim()
+      : typeof triggerConfig.schedule === "string"
+        ? triggerConfig.schedule.trim()
+        : "";
+  return cron.length > 0 ? cron : null;
+}
 
 async function assertProjectOwnership(projectId: string, userId: string): Promise<boolean> {
   const project = await prisma.project.findFirst({
@@ -65,7 +77,17 @@ export async function GET(
     return NextResponse.json({ success: false, error: "Agent not found" }, { status: 404 });
   }
 
-  return NextResponse.json({ success: true, data: agent });
+  const cron = getScheduledCron(agent.triggerConfig as Record<string, unknown> | undefined);
+  const nextScheduledAt =
+    agent.triggerType === "SCHEDULED" && cron ? getNextScheduledAt(cron) : null;
+
+  return NextResponse.json({
+    success: true,
+    data: {
+      ...agent,
+      nextScheduledAt: nextScheduledAt?.toISOString() ?? null,
+    },
+  });
 }
 
 export async function PATCH(
@@ -90,6 +112,23 @@ export async function PATCH(
       { success: false, error: parsed.error.issues[0].message },
       { status: 400 }
     );
+  }
+
+  const nextTriggerType = parsed.data.triggerType;
+  if (nextTriggerType === "SCHEDULED" || parsed.data.triggerConfig !== undefined) {
+    const cron = getScheduledCron(parsed.data.triggerConfig);
+    if (nextTriggerType === "SCHEDULED" && (!cron || !isValidCronExpression(cron))) {
+      return NextResponse.json(
+        { success: false, error: "Scheduled agents require a valid cron expression in triggerConfig.cron" },
+        { status: 400 }
+      );
+    }
+    if (cron && !isValidCronExpression(cron)) {
+      return NextResponse.json(
+        { success: false, error: "triggerConfig.cron must be a valid cron expression" },
+        { status: 400 }
+      );
+    }
   }
 
   const updateData: Prisma.AgentUpdateManyMutationInput = {};

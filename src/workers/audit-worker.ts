@@ -33,7 +33,7 @@ const allRules: AuditRule[] = [
 ];
 
 const ISSUE_CREATE_BATCH_SIZE = 500;
-const ISSUE_UPDATE_CONCURRENCY = 20;
+const ISSUE_UPDATE_CONCURRENCY = 4;
 const EVENT_LOOP_YIELD_INTERVAL = 50;
 const AUDIT_PROGRESS_LOG_INTERVAL = 5000;
 
@@ -135,6 +135,11 @@ async function yieldToEventLoop(): Promise<void> {
 
 export async function runAudit(projectId: string, crawlId: string) {
   console.log(`[Audit Engine] Starting audit for project ${projectId}, crawl ${crawlId}`);
+
+  const projectBeforeAudit = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { healthScore: true },
+  });
 
   const crawlPageRows = await prisma.crawlPage.findMany({
     where: { crawlId },
@@ -374,5 +379,10 @@ export async function runAudit(projectId: string, crawlId: string) {
     `[Audit Engine] Audit complete: ${issueCount} new issues, health score: ${healthScore}`
   );
 
-  return { issueCount, healthScore };
+  return {
+    issueCount,
+    healthScore,
+    previousHealthScore: projectBeforeAudit?.healthScore ?? null,
+    activeIssueCount: allIssues.filter((i) => !i.isWhitelisted).length,
+  };
 }

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { Prisma, TriggerType } from "@prisma/client";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { getNextScheduledAt, isValidCronExpression } from "@/lib/scheduler";
 import { z } from "zod";
 
 const createAgentSchema = z.object({
@@ -23,6 +24,17 @@ const createAgentSchema = z.object({
   webhookEnabled: z.boolean().optional(),
   webhookUrl: z.string().url().optional(),
 });
+
+function getScheduledCron(triggerConfig: Record<string, unknown> | undefined): string | null {
+  if (!triggerConfig) return null;
+  const cron =
+    typeof triggerConfig.cron === "string"
+      ? triggerConfig.cron.trim()
+      : typeof triggerConfig.schedule === "string"
+        ? triggerConfig.schedule.trim()
+        : "";
+  return cron.length > 0 ? cron : null;
+}
 
 export async function GET(
   _req: NextRequest,
@@ -50,7 +62,19 @@ export async function GET(
     },
   });
 
-  return NextResponse.json({ success: true, data: agents });
+  return NextResponse.json({
+    success: true,
+    data: agents.map((agent) => {
+      const cron = getScheduledCron(agent.triggerConfig as Record<string, unknown> | undefined);
+      const nextScheduledAt =
+        agent.triggerType === "SCHEDULED" && cron ? getNextScheduledAt(cron) : null;
+
+      return {
+        ...agent,
+        nextScheduledAt: nextScheduledAt?.toISOString() ?? null,
+      };
+    }),
+  });
 }
 
 export async function POST(
@@ -78,6 +102,16 @@ export async function POST(
       { success: false, error: parsed.error.issues[0].message },
       { status: 400 }
     );
+  }
+
+  if (parsed.data.triggerType === "SCHEDULED") {
+    const cron = getScheduledCron(parsed.data.triggerConfig);
+    if (!cron || !isValidCronExpression(cron)) {
+      return NextResponse.json(
+        { success: false, error: "Scheduled agents require a valid cron expression in triggerConfig.cron" },
+        { status: 400 }
+      );
+    }
   }
 
   const agent = await prisma.agent.create({

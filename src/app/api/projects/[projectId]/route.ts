@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { getNextScheduledAt, isValidCronExpression } from "@/lib/scheduler";
 import {
   areEquivalentSiteUrls,
   normalizeOptionalSitemapUrl,
@@ -22,7 +23,7 @@ const updateProjectSchema = z
     description: z.string().trim().max(2000).nullable().optional(),
     maxCrawlPages: z.number().int().min(1).max(100000).optional(),
     crawlSchedule: z.string().trim().min(1).max(120).optional(),
-  })
+})
   .passthrough();
 
 export async function GET(
@@ -107,8 +108,18 @@ export async function GET(
     diff: crawlDiffById.get(crawl.id) ?? null,
   }));
 
+  const nextScheduledAt = getNextScheduledAt(project.crawlSchedule || "manual");
+
   return NextResponse.json(
-    { success: true, data: { ...project, crawls } },
+    {
+      success: true,
+      data: {
+        ...project,
+        crawls,
+        schedulerEnabled: project.crawlSchedule !== "manual",
+        nextScheduledAt: nextScheduledAt?.toISOString() ?? null,
+      },
+    },
     { headers: { "Cache-Control": "no-store, max-age=0" } }
   );
 }
@@ -175,7 +186,15 @@ export async function PATCH(
   }
   if (parsed.data.description !== undefined) updateData.description = parsed.data.description;
   if (parsed.data.maxCrawlPages !== undefined) updateData.maxCrawlPages = parsed.data.maxCrawlPages;
-  if (parsed.data.crawlSchedule !== undefined) updateData.crawlSchedule = parsed.data.crawlSchedule;
+  if (parsed.data.crawlSchedule !== undefined) {
+    if (!isValidCronExpression(parsed.data.crawlSchedule, true)) {
+      return NextResponse.json(
+        { success: false, error: "Crawl schedule must be a valid cron expression or 'manual'" },
+        { status: 400 }
+      );
+    }
+    updateData.crawlSchedule = parsed.data.crawlSchedule;
+  }
 
   if (Object.keys(updateData).length === 0) {
     return NextResponse.json(

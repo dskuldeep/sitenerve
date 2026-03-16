@@ -32,6 +32,7 @@ interface Agent {
   name: string;
   description: string | null;
   triggerType: string;
+  nextScheduledAt: string | null;
   isActive: boolean;
   lastRunAt: string | null;
   lastRunStatus: string | null;
@@ -57,6 +58,7 @@ export default function AgentsPage() {
     description: "",
     agentType: "TECHNICAL_SEO_AUDITOR",
     triggerType: "MANUAL",
+    scheduleCron: "0 2 * * *",
     geminiModel: PROFILE_DEFAULT_MODEL_VALUE,
   });
 
@@ -99,6 +101,10 @@ export default function AgentsPage() {
           prompt: seed.prompt,
           seedPrompt: seed.prompt,
           triggerType: newAgent.triggerType,
+          triggerConfig:
+            newAgent.triggerType === "SCHEDULED"
+              ? { cron: newAgent.scheduleCron.trim() }
+              : undefined,
           geminiModel:
             newAgent.geminiModel === PROFILE_DEFAULT_MODEL_VALUE
               ? undefined
@@ -193,6 +199,22 @@ export default function AgentsPage() {
                   </SelectContent>
                 </Select>
               </div>
+              {newAgent.triggerType === "SCHEDULED" && (
+                <div className="space-y-2">
+                  <Label className="text-[#94A3B8]">Schedule Cron</Label>
+                  <Input
+                    value={newAgent.scheduleCron}
+                    onChange={(e) =>
+                      setNewAgent((prev) => ({ ...prev, scheduleCron: e.target.value }))
+                    }
+                    placeholder="0 2 * * *"
+                    className="bg-[#1E293B] border-[#334155] text-[#F8FAFC] placeholder:text-[#64748B]"
+                  />
+                  <p className="text-[10px] text-[#64748B]">
+                    Example: <code>0 2 * * *</code> runs daily at 02:00 UTC.
+                  </p>
+                </div>
+              )}
               <div className="space-y-2">
                 <Label className="text-[#94A3B8]">Model</Label>
                 <Select
@@ -241,7 +263,12 @@ export default function AgentsPage() {
               <div className="flex justify-end gap-2">
                 <Button variant="ghost" onClick={() => setCreateOpen(false)}
                   className="text-[#94A3B8] hover:text-[#F8FAFC] hover:bg-[#1E293B]">Cancel</Button>
-                <Button onClick={() => createAgent.mutate()} disabled={createAgent.isPending}
+                <Button
+                  onClick={() => createAgent.mutate()}
+                  disabled={
+                    createAgent.isPending ||
+                    (newAgent.triggerType === "SCHEDULED" && !newAgent.scheduleCron.trim())
+                  }
                   className="bg-blue-600 hover:bg-blue-700 text-white">
                   {createAgent.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                   Create Agent
@@ -306,12 +333,21 @@ export default function AgentsPage() {
                 </div>
 
                 <div className="flex items-center justify-between pt-2 border-t border-[#1E293B]">
-                  <span className="text-[10px] text-[#64748B] flex items-center gap-1">
-                    <Clock className="h-3 w-3" />
-                    {agent.lastRunAt
-                      ? `Last run ${formatDistanceToNow(new Date(agent.lastRunAt), { addSuffix: true })}`
-                      : "Never run"}
-                  </span>
+                  <div className="space-y-1">
+                    <span className="block text-[10px] text-[#64748B] flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      {agent.lastRunAt
+                        ? `Last run ${formatDistanceToNow(new Date(agent.lastRunAt), { addSuffix: true })}`
+                        : "Never run"}
+                    </span>
+                    {agent.triggerType === "SCHEDULED" && (
+                      <span className="block text-[10px] text-cyan-400">
+                        {agent.nextScheduledAt
+                          ? `Next run ${formatDistanceToNow(new Date(agent.nextScheduledAt), { addSuffix: true })}`
+                          : "Waiting for valid schedule"}
+                      </span>
+                    )}
+                  </div>
                   <div className="flex gap-1">
                     <Button variant="ghost" size="sm"
                       onClick={() => runAgent.mutate(agent.id)}

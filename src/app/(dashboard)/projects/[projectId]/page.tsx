@@ -41,6 +41,9 @@ interface ProjectDetail {
   name: string;
   siteUrl: string;
   status: string;
+  crawlSchedule: string;
+  schedulerEnabled: boolean;
+  nextScheduledAt: string | null;
   healthScore: number;
   totalPages: number;
   totalIssues: number;
@@ -318,6 +321,33 @@ export default function ProjectOverviewPage() {
           </CardContent>
         </Card>
       )}
+
+      <Card className="bg-[#111827] border-[#1E293B]">
+        <CardContent className="p-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <p className="text-xs text-[#64748B] mb-1">Scheduler</p>
+            <p className="text-sm font-medium text-[#F8FAFC]">
+              {project.schedulerEnabled ? "Enabled" : "Manual only"}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs text-[#64748B] mb-1">Next automatic crawl</p>
+            <p className="text-sm font-medium text-cyan-400">
+              {project.schedulerEnabled && project.nextScheduledAt
+                ? formatDistanceToNow(new Date(project.nextScheduledAt), {
+                    addSuffix: true,
+                  })
+                : "Disabled"}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs text-[#64748B] mb-1">Saved cron</p>
+            <p className="text-sm font-medium text-[#F8FAFC] font-mono">
+              {project.crawlSchedule || "manual"}
+            </p>
+          </div>
+        </CardContent>
+      </Card>
 
       {latestCrawl && (
         <Card className="bg-[#050814] border-[#1E293B]">

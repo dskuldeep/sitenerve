@@ -13,7 +13,9 @@ import {
   Eye,
   EyeOff,
   Bug,
+  Clock3,
 } from "lucide-react";
+import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -43,6 +45,9 @@ interface ProjectSettings {
   siteUrl: string;
   crawlSchedule?: string | null;
   maxCrawlPages: number;
+  lastCrawlAt?: string | null;
+  schedulerEnabled?: boolean;
+  nextScheduledAt?: string | null;
 }
 
 interface WebhookConfig {
@@ -58,6 +63,7 @@ const WEBHOOK_EVENTS = [
   { id: "audit.completed", label: "Audit Completed" },
   { id: "issues.new", label: "New Issues Detected" },
   { id: "health.changed", label: "Health Score Changed" },
+  { id: "agent.completed", label: "Agent Completed" },
 ];
 
 function scheduleToFrequency(schedule?: string | null): string {
@@ -81,6 +87,11 @@ function frequencyToSchedule(frequency: string): string {
     default:
       return "0 2 * * *";
   }
+}
+
+function formatRelativeTimestamp(value?: string | null): string {
+  if (!value) return "Not yet";
+  return formatDistanceToNow(new Date(value), { addSuffix: true });
 }
 
 export default function ProjectSettingsPage() {
@@ -350,6 +361,45 @@ export default function ProjectSettingsPage() {
               <p className="text-xs text-[#64748B]">
                 Crawl schedule is stored as project-level schedule and controls automatic recrawls.
               </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="rounded-lg border border-[#1E293B] bg-[#0A0F1C] p-3">
+                <p className="text-[11px] uppercase tracking-wide text-[#64748B]">
+                  Scheduler
+                </p>
+                <p className="mt-1 text-sm font-medium text-[#F8FAFC]">
+                  {project?.schedulerEnabled ? "Enabled" : "Manual only"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-[#1E293B] bg-[#0A0F1C] p-3">
+                <p className="text-[11px] uppercase tracking-wide text-[#64748B]">
+                  Next automatic crawl
+                </p>
+                <p className="mt-1 text-sm font-medium text-[#F8FAFC]">
+                  {project?.schedulerEnabled
+                    ? formatRelativeTimestamp(project?.nextScheduledAt)
+                    : "Disabled"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-[#1E293B] bg-[#0A0F1C] p-3">
+                <p className="text-[11px] uppercase tracking-wide text-[#64748B]">
+                  Last crawl
+                </p>
+                <p className="mt-1 text-sm font-medium text-[#F8FAFC]">
+                  {formatRelativeTimestamp(project?.lastCrawlAt)}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+              <div className="flex items-center gap-2 text-xs text-[#94A3B8]">
+                <Clock3 className="h-3.5 w-3.5 text-cyan-400" />
+                <span>Saved cron:</span>
+                <code className="rounded bg-[#111827] px-1.5 py-0.5 text-[#F8FAFC]">
+                  {project?.crawlSchedule || "manual"}
+                </code>
+              </div>
             </div>
 
             <div className="flex justify-end">

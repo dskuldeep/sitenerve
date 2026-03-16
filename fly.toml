@@ -1,0 +1,36 @@
+app = "sitenerve"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  HOSTNAME = "0.0.0.0"
+  NEXT_TELEMETRY_DISABLED = "1"
+  CRAWLER_MEMORY_MBYTES = "4096"
+  WORKER_MAX_OLD_SPACE_MBYTES = "6144"
+  PRISMA_CONNECTION_LIMIT = "10"
+  PRISMA_POOL_TIMEOUT_SECONDS = "30"
+
+[processes]
+  app = "node scripts/fly-runner.mjs"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 25
+    hard_limit = 50
+
+[[vm]]
+  processes = ["app"]
+  size = "performance-4x"
+  memory = "8192mb"

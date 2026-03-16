@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useState, useEffect } from "react";
-import { useSession } from "next-auth/react";
+import { signOut, useSession } from "next-auth/react";
 import { toast } from "sonner";
 import {
   User,
@@ -64,7 +64,10 @@ export default function AccountSettingsPage() {
         throw new Error(data.error || "Failed to update profile");
       }
 
-      await updateSession();
+      await updateSession({
+        name,
+        image: image || null,
+      });
       toast.success("Profile updated successfully");
     } catch (error) {
       toast.error(
@@ -133,7 +136,7 @@ export default function AccountSettingsPage() {
       }
 
       toast.success("Account deleted");
-      window.location.href = "/login";
+      await signOut({ callbackUrl: "/login" });
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to delete account"
