@@ -344,6 +344,8 @@ model AgentRun {
   tokensUsed    Int?
   modelUsed     String?
   rawOutput     String?        @db.Text
+  /// Structured tool loop: function calls, results, and terminal submit/text (JSON).
+  toolTrace     Json?
   errorMessage  String?
   createdAt     DateTime       @default(now())
 

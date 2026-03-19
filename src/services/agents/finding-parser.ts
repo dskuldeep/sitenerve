@@ -108,6 +108,22 @@ function extractJsonArray(text: string): unknown[] | null {
   return null;
 }
 
+export function parseFindingsFromRawArray(raw: unknown[]): AgentFindingData[] {
+  const findings: AgentFindingData[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const validated = validateFinding(raw[i]);
+    if (validated) {
+      findings.push(validated);
+    } else {
+      console.warn(
+        `[FindingParser] Skipping invalid tool finding at index ${i}:`,
+        JSON.stringify(raw[i]).substring(0, 200)
+      );
+    }
+  }
+  return findings;
+}
+
 export function parseFindings(output: string): AgentFindingData[] {
   if (!output || !output.trim()) {
     console.warn("[FindingParser] Empty output received");

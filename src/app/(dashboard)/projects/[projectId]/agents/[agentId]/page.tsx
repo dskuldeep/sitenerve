@@ -6,7 +6,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import dynamic from "next/dynamic";
 import {
-  Play, RotateCcw, Save, Loader2, Clock, Hash, Brain, Trash2,
+  Play, RotateCcw, Save, Loader2, Clock, Hash, Brain, Trash2, ChevronDown,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,6 +22,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Accordion, AccordionContent, AccordionItem, AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { SeverityBadge } from "@/components/issues/severity-badge";
 import { StatusIndicator } from "@/components/shared/status-indicator";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -30,12 +35,73 @@ import { TRIGGER_TYPES } from "@/lib/constants";
 import {
   getAgentContextConfigFromTriggerConfig,
   mergeAgentTriggerConfig,
+  parseAgentRunToolTrace,
   type AgentContextConfig,
+  type AgentRunToolTraceStep,
 } from "@/types/agents";
 import { formatDistanceToNow } from "date-fns";
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 const PROFILE_DEFAULT_MODEL_VALUE = "__PROFILE_DEFAULT__";
+
+function ToolTraceBlock({ step, index }: { step: AgentRunToolTraceStep; index: number }) {
+  if (step.type === "function_calls") {
+    return (
+      <div className="rounded-md border border-[#1E293B] bg-[#111827] p-3 space-y-2">
+        <p className="text-[10px] uppercase tracking-wide text-emerald-400/90">
+          Step {index + 1} — Model called tools
+        </p>
+        {step.calls.map((c, j) => (
+          <div key={`${c.name}-${j}`} className="space-y-1">
+            <code className="text-xs text-[#F8FAFC]">{c.name}</code>
+            <pre className="overflow-x-auto text-[10px] leading-relaxed text-[#94A3B8] bg-[#0A0F1C] rounded p-2 border border-[#1E293B] max-h-40 overflow-y-auto">
+              {JSON.stringify(c.args, null, 2)}
+            </pre>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (step.type === "function_results") {
+    return (
+      <div className="rounded-md border border-[#1E293B] bg-[#111827] p-3 space-y-2">
+        <p className="text-[10px] uppercase tracking-wide text-sky-400/90">
+          Step {index + 1} — Tool results
+        </p>
+        {step.results.map((r, j) => (
+          <div key={`${r.name}-${j}`} className="space-y-1">
+            <code className="text-xs text-[#F8FAFC]">{r.name}</code>
+            <pre className="overflow-x-auto text-[10px] leading-relaxed text-[#94A3B8] bg-[#0A0F1C] rounded p-2 border border-[#1E293B] max-h-48 overflow-y-auto">
+              {JSON.stringify(r.response, null, 2)}
+            </pre>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (step.type === "submit_findings") {
+    return (
+      <div className="rounded-md border border-violet-500/25 bg-violet-500/10 p-3">
+        <p className="text-[10px] uppercase tracking-wide text-violet-300">
+          Step {index + 1} — submit_agent_results
+        </p>
+        <p className="text-xs text-[#CBD5E1] mt-1">
+          Submitted <strong>{step.findingsCount}</strong> finding{step.findingsCount === 1 ? "" : "s"}
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-md border border-amber-500/20 bg-amber-500/5 p-3">
+      <p className="text-[10px] uppercase tracking-wide text-amber-200/90">
+        Step {index + 1} — Model text (no tool calls)
+      </p>
+      <pre className="mt-2 text-[10px] text-[#94A3B8] whitespace-pre-wrap max-h-40 overflow-y-auto">
+        {step.text}
+      </pre>
+    </div>
+  );
+}
 
 interface GeminiModelOption {
   id: string;
@@ -69,6 +135,8 @@ interface AgentDetail {
     duration: number | null;
     tokensUsed: number | null;
     modelUsed: string | null;
+    errorMessage: string | null;
+    toolTrace: unknown | null;
     findings: Array<{
       id: string;
       type: string;
@@ -95,6 +163,8 @@ interface AgentDraft {
 interface AgentRuntimePreview {
   fullPrompt: string;
   model: string | null;
+  toolLoopEnabled: boolean;
+  toolNames: string[];
   summary: {
     siteUrl: string;
     totalPages: number;
@@ -415,7 +485,8 @@ export default function AgentDetailPage() {
             <CardHeader className="pb-3">
               <CardTitle className="text-sm text-[#94A3B8]">Runtime Preview</CardTitle>
               <p className="text-xs text-[#64748B]">
-                Inspect the exact prompt sections and site context that will be passed to the agent.
+                Inspect bootstrap prompt sections. In tool mode the model also receives callable tools to fetch
+                pages, issues, and crawl deltas on demand.
               </p>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -446,6 +517,19 @@ export default function AgentDetailPage() {
                     <p className="mt-1 truncate text-xs text-[#F8FAFC]">
                       {previewQuery.data.model || "Profile default"}
                     </p>
+                  </div>
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2 col-span-2 lg:col-span-3">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Execution</p>
+                    <p className="mt-1 text-xs text-[#F8FAFC]">
+                      {previewQuery.data.toolLoopEnabled
+                        ? "Tool loop — fetches data in batches via Gemini function calls"
+                        : "Single-shot — full context inlined (set AGENT_USE_TOOL_LOOP=false)"}
+                    </p>
+                    {previewQuery.data.toolLoopEnabled && previewQuery.data.toolNames.length > 0 && (
+                      <p className="mt-1 text-[10px] text-[#64748B] break-words">
+                        Tools: {previewQuery.data.toolNames.join(", ")}
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
@@ -509,6 +593,13 @@ export default function AgentDetailPage() {
                     </ScrollArea>
                   </TabsContent>
                   <TabsContent value="full-prompt">
+                    {previewQuery.data.toolLoopEnabled && (
+                      <p className="text-[10px] text-[#64748B] mb-2">
+                        Includes an appendix with the same function declarations (name, description, parameter JSON)
+                        the model receives as Gemini tools — the live API registers tools separately; this is for
+                        visibility in preview.
+                      </p>
+                    )}
                     <ScrollArea className="h-[360px] rounded-md border border-[#1E293B] bg-[#0A0F1C]">
                       <pre className="whitespace-pre-wrap p-4 text-[11px] leading-5 text-[#CBD5E1]">
                         {previewQuery.data.fullPrompt}
@@ -782,7 +873,9 @@ export default function AgentDetailPage() {
             </p>
           ) : (
             <Accordion>
-              {agent.runs.map((run) => (
+              {agent.runs.map((run) => {
+                const runTrace = parseAgentRunToolTrace(run.toolTrace);
+                return (
                 <AccordionItem key={run.id} value={run.id} className="border-[#1E293B]">
                   <AccordionTrigger className="hover:no-underline py-3">
                     <div className="flex items-center gap-3 text-left">
@@ -803,11 +896,49 @@ export default function AgentDetailPage() {
                       <Badge variant="outline" className="text-[10px] bg-[#1E293B] text-[#64748B] border-[#334155]">
                         {run.findings.length} findings
                       </Badge>
+                      {runTrace && runTrace.steps.length > 0 && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                        >
+                          {runTrace.steps.length} tool steps
+                        </Badge>
+                      )}
                     </div>
                   </AccordionTrigger>
                   <AccordionContent>
+                    {run.status === "FAILED" && (
+                      <p className="text-xs text-red-300/90 bg-red-950/40 border border-red-500/20 rounded p-2 mb-2 whitespace-pre-wrap break-words">
+                        {run.errorMessage?.trim() ||
+                          "Run failed (no error message stored). Check worker logs."}
+                      </p>
+                    )}
+                    {runTrace && runTrace.steps.length > 0 && (
+                      <Collapsible defaultOpen={false} className="mb-4 rounded-md border border-[#1E293B] bg-[#0A0F1C]">
+                        <CollapsibleTrigger className="group flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left outline-none hover:bg-[#111827] transition-colors rounded-md">
+                          <div className="min-w-0 flex-1">
+                            <p className="text-xs font-medium text-[#94A3B8]">
+                              Tool trace · {runTrace.steps.length} steps
+                            </p>
+                            <p className="text-[10px] text-[#64748B] mt-0.5">
+                              Calls and payloads (large responses may be truncated for storage). Click to expand.
+                            </p>
+                          </div>
+                          <ChevronDown className="size-4 shrink-0 text-[#64748B] transition-transform group-aria-expanded:rotate-180" />
+                        </CollapsibleTrigger>
+                        <CollapsibleContent className="border-t border-[#1E293B] px-3 pb-3 pt-2">
+                          <div className="space-y-2">
+                            {runTrace.steps.map((step, i) => (
+                              <ToolTraceBlock key={i} step={step} index={i} />
+                            ))}
+                          </div>
+                        </CollapsibleContent>
+                      </Collapsible>
+                    )}
                     {run.findings.length === 0 ? (
-                      <p className="text-xs text-[#64748B] py-2">No findings from this run.</p>
+                      run.status !== "FAILED" ? (
+                        <p className="text-xs text-[#64748B] py-2">No findings from this run.</p>
+                      ) : null
                     ) : (
                       <div className="space-y-2">
                         {run.findings.map((finding) => (
@@ -831,7 +962,8 @@ export default function AgentDetailPage() {
                     )}
                   </AccordionContent>
                 </AccordionItem>
-              ))}
+                );
+              })}
             </Accordion>
           )}
         </CardContent>

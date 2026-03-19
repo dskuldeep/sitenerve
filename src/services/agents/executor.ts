@@ -1,7 +1,9 @@
 import { prisma } from "@/lib/prisma";
+import { Prisma } from "@prisma/client";
 import { createGeminiClient, generateContent } from "@/lib/gemini";
-import { parseFindings } from "./finding-parser";
+import { parseFindings, parseFindingsFromRawArray } from "./finding-parser";
 import type { IssueSeverity } from "@prisma/client";
+import { runAgenticGeminiLoop } from "./agent-tools";
 import { resolveAgentRuntime, type AgentRuntimeOverrides } from "./runtime";
 
 async function sendAgentWebhookIfEnabled(options: {
@@ -74,15 +76,35 @@ export async function executeAgent(
     const runtime = await resolveAgentRuntime(agentId, overrides);
     const fullPrompt = runtime.fullPrompt;
 
-    // Call Gemini API
     const model = runtime.model;
     const temperature = runtime.temperature;
     const client = createGeminiClient(agent.project.user.geminiApiKey);
 
-    const rawOutput = await generateContent(client, model, fullPrompt, temperature);
+    let rawOutput: string;
+    let findingsData;
 
-    // Parse findings from the response
-    const findingsData = parseFindings(rawOutput);
+    let toolTraceForDb: Prisma.InputJsonValue | undefined;
+
+    if (runtime.toolLoopEnabled) {
+      const loop = await runAgenticGeminiLoop({
+        client,
+        model,
+        temperature,
+        bootstrapUserMessage: fullPrompt,
+        projectId: agent.projectId,
+        toolLimits: runtime.toolLimits,
+        contextConfig: runtime.contextConfig,
+      });
+      rawOutput = loop.transcript.slice(0, 50_000);
+      toolTraceForDb = loop.toolTrace as unknown as Prisma.InputJsonValue;
+      findingsData = parseFindingsFromRawArray(loop.rawFindings);
+      if (findingsData.length === 0 && loop.fallbackText?.trim()) {
+        findingsData = parseFindings(loop.fallbackText);
+      }
+    } else {
+      rawOutput = await generateContent(client, model, fullPrompt, temperature);
+      findingsData = parseFindings(rawOutput);
+    }
 
     // Store findings in the database
     if (findingsData.length > 0) {
@@ -112,6 +134,7 @@ export async function executeAgent(
         duration,
         modelUsed: model,
         rawOutput: rawOutput.substring(0, 50000), // Truncate for storage
+        ...(toolTraceForDb !== undefined ? { toolTrace: toolTraceForDb } : {}),
       },
     });
 

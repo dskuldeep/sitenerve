@@ -89,3 +89,28 @@ export interface AgentFindingData {
   confidence?: number;
   source?: string;
 }
+
+/** Persisted on AgentRun.toolTrace for tool-loop runs. */
+export type AgentRunToolTraceStep =
+  | {
+      type: "function_calls";
+      calls: Array<{ name: string; args: unknown }>;
+    }
+  | {
+      type: "function_results";
+      results: Array<{ name: string; response: unknown }>;
+    }
+  | { type: "submit_findings"; findingsCount: number }
+  | { type: "model_text"; text: string };
+
+export interface AgentRunToolTrace {
+  version: 1;
+  steps: AgentRunToolTraceStep[];
+}
+
+export function parseAgentRunToolTrace(value: unknown): AgentRunToolTrace | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (v.version !== 1 || !Array.isArray(v.steps)) return null;
+  return value as AgentRunToolTrace;
+}

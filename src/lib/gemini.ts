@@ -85,9 +85,36 @@ export async function generateContent(
     },
   });
 
-  const result = await genModel.generateContent(prompt);
-  const response = result.response;
-  return response.text();
+  try {
+    const result = await genModel.generateContent(prompt);
+    const response = result.response;
+    const feedback = response.promptFeedback;
+    if (feedback?.blockReason) {
+      const msg = feedback.blockReasonMessage
+        ? `${feedback.blockReason}: ${feedback.blockReasonMessage}`
+        : String(feedback.blockReason);
+      throw new Error(`Gemini blocked the request (${msg})`);
+    }
+    return response.text();
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.startsWith("Gemini blocked") ||
+        error.message.startsWith("Gemini request failed"))
+    ) {
+      throw error;
+    }
+    const fromApi =
+      error &&
+      typeof error === "object" &&
+      "message" in error &&
+      typeof (error as { message: unknown }).message === "string"
+        ? (error as { message: string }).message
+        : null;
+    throw new Error(
+      fromApi ? `Gemini request failed: ${fromApi}` : "Gemini request failed"
+    );
+  }
 }
 
 export async function verifyApiKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
