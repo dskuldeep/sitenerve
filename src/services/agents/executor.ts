@@ -1,9 +1,8 @@
 import { prisma } from "@/lib/prisma";
 import { createGeminiClient, generateContent } from "@/lib/gemini";
-import { assemblePrompt, type ProjectContext } from "./prompt-assembler";
-import { resolveSkills } from "./skill-resolver";
 import { parseFindings } from "./finding-parser";
 import type { IssueSeverity } from "@prisma/client";
+import { resolveAgentRuntime, type AgentRuntimeOverrides } from "./runtime";
 
 async function sendAgentWebhookIfEnabled(options: {
   enabled: boolean;
@@ -27,119 +26,10 @@ async function sendAgentWebhookIfEnabled(options: {
   }
 }
 
-async function loadProjectContext(projectId: string): Promise<ProjectContext> {
-  const project = await prisma.project.findUniqueOrThrow({
-    where: { id: projectId },
-    select: {
-      id: true,
-      siteUrl: true,
-      totalPages: true,
-      totalIssues: true,
-      healthScore: true,
-    },
-  });
-
-  const pages = await prisma.page.findMany({
-    where: { projectId },
-    select: {
-      url: true,
-      statusCode: true,
-      title: true,
-      metaDescription: true,
-      h1: true,
-      wordCount: true,
-      responseTime: true,
-      pageSize: true,
-      canonicalUrl: true,
-      metaRobots: true,
-      jsonLd: true,
-      internalLinks: true,
-      externalLinks: true,
-      images: true,
-    },
-    orderBy: { url: "asc" },
-  });
-
-  const issues = await prisma.issue.findMany({
-    where: { projectId, status: "ACTIVE" },
-    select: {
-      ruleId: true,
-      category: true,
-      severity: true,
-      title: true,
-      description: true,
-      affectedUrl: true,
-      evidence: true,
-    },
-    orderBy: { severity: "desc" },
-  });
-
-  return {
-    projectId: project.id,
-    siteUrl: project.siteUrl,
-    totalPages: project.totalPages,
-    totalIssues: project.totalIssues,
-    healthScore: project.healthScore,
-    pages: pages.map((p) => ({
-      url: p.url,
-      statusCode: p.statusCode,
-      title: p.title,
-      metaDescription: p.metaDescription,
-      h1: p.h1,
-      wordCount: p.wordCount,
-      responseTime: p.responseTime,
-      pageSize: p.pageSize,
-      canonicalUrl: p.canonicalUrl,
-      metaRobots: p.metaRobots,
-      jsonLd: p.jsonLd as unknown[] | null,
-      internalLinks: p.internalLinks as Array<{ href: string; text: string }> | null,
-      externalLinks: p.externalLinks as Array<{ href: string; text: string }> | null,
-      images: p.images as Array<{
-        src: string;
-        alt: string;
-        width?: number;
-        height?: number;
-      }> | null,
-    })),
-    issues: issues.map((i) => ({
-      ruleId: i.ruleId,
-      category: i.category,
-      severity: i.severity,
-      title: i.title,
-      description: i.description,
-      affectedUrl: i.affectedUrl,
-      evidence: i.evidence as Record<string, unknown> | null,
-    })),
-  };
-}
-
-async function loadPreviousFindings(agentId: string): Promise<Array<{
-  title: string;
-  severity: string;
-  type: string;
-  status: string;
-}>> {
-  const lastRun = await prisma.agentRun.findFirst({
-    where: { agentId, status: "SUCCESS" },
-    orderBy: { createdAt: "desc" },
-    select: {
-      findings: {
-        select: { title: true, severity: true, type: true },
-      },
-    },
-  });
-
-  if (!lastRun) return [];
-
-  return lastRun.findings.map((f) => ({
-    title: f.title,
-    severity: f.severity,
-    type: f.type,
-    status: "previous",
-  }));
-}
-
-export async function executeAgent(agentId: string): Promise<string> {
+export async function executeAgent(
+  agentId: string,
+  overrides: AgentRuntimeOverrides = {}
+): Promise<string> {
   // Load agent configuration
   const agent = await prisma.agent.findUniqueOrThrow({
     where: { id: agentId },
@@ -181,27 +71,12 @@ export async function executeAgent(agentId: string): Promise<string> {
   const startTime = Date.now();
 
   try {
-    // Resolve skills from skills.sh
-    const skillIds = (agent.skills as string[]) || [];
-    const skills = await resolveSkills(skillIds);
-
-    // Load project context
-    const context = await loadProjectContext(agent.projectId);
-
-    // Load previous run findings for delta analysis
-    const previousFindings = await loadPreviousFindings(agent.id);
-
-    // Assemble the full prompt
-    const fullPrompt = assemblePrompt({
-      prompt: agent.prompt,
-      skills,
-      context,
-      previousFindings,
-    });
+    const runtime = await resolveAgentRuntime(agentId, overrides);
+    const fullPrompt = runtime.fullPrompt;
 
     // Call Gemini API
-    const model = agent.geminiModel || agent.project.user.geminiModel;
-    const temperature = agent.project.user.temperature;
+    const model = runtime.model;
+    const temperature = runtime.temperature;
     const client = createGeminiClient(agent.project.user.geminiApiKey);
 
     const rawOutput = await generateContent(client, model, fullPrompt, temperature);

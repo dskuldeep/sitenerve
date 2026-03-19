@@ -14,16 +14,24 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Accordion, AccordionContent, AccordionItem, AccordionTrigger,
 } from "@/components/ui/accordion";
 import { SeverityBadge } from "@/components/issues/severity-badge";
 import { StatusIndicator } from "@/components/shared/status-indicator";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
+import { useDebounce } from "@/hooks/use-debounce";
 import { TRIGGER_TYPES } from "@/lib/constants";
+import {
+  getAgentContextConfigFromTriggerConfig,
+  mergeAgentTriggerConfig,
+  type AgentContextConfig,
+} from "@/types/agents";
 import { formatDistanceToNow } from "date-fns";
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
@@ -77,10 +85,33 @@ interface AgentDraft {
   prompt: string;
   triggerType: string;
   scheduleCron: string;
+  contextConfig: AgentContextConfig;
   geminiModel: string;
   webhookEnabled: boolean;
   webhookUrl: string;
   isActive: boolean;
+}
+
+interface AgentRuntimePreview {
+  fullPrompt: string;
+  model: string | null;
+  summary: {
+    siteUrl: string;
+    totalPages: number;
+    totalIssues: number;
+    healthScore: number;
+    previousFindingsCount: number;
+    attachedSkillsCount: number;
+  };
+  sections: Array<{
+    key: string;
+    title: string;
+    description: string;
+    content: string;
+    included: boolean;
+    available: boolean;
+    itemCount?: number;
+  }>;
 }
 
 function toDraft(agent: AgentDetail): AgentDraft {
@@ -94,6 +125,7 @@ function toDraft(agent: AgentDetail): AgentDraft {
         : typeof agent.triggerConfig?.schedule === "string"
           ? agent.triggerConfig.schedule
           : "0 2 * * *",
+    contextConfig: getAgentContextConfigFromTriggerConfig(agent.triggerConfig),
     geminiModel: agent.geminiModel || "",
     webhookEnabled: agent.webhookEnabled,
     webhookUrl: agent.webhookUrl || "",
@@ -138,6 +170,38 @@ export default function AgentDetailPage() {
     },
   });
 
+  const baseDraft = useMemo(() => (agent ? toDraft(agent) : null), [agent]);
+  const activeDraft = draft || baseDraft;
+  const previewPayload = useMemo(
+    () =>
+      activeDraft
+        ? {
+            prompt: activeDraft.prompt,
+            geminiModel: activeDraft.geminiModel || null,
+            contextConfig: activeDraft.contextConfig,
+          }
+        : null,
+    [activeDraft]
+  );
+  const debouncedPreviewPayload = useDebounce(previewPayload, 400);
+
+  const previewQuery = useQuery<AgentRuntimePreview>({
+    queryKey: ["agent-preview", agentId, debouncedPreviewPayload],
+    enabled: Boolean(agent && debouncedPreviewPayload),
+    queryFn: async () => {
+      const res = await fetch(`/api/projects/${projectId}/agents/${agentId}/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(debouncedPreviewPayload),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.success) {
+        throw new Error(json.error || "Failed to load runtime preview");
+      }
+      return json.data as AgentRuntimePreview;
+    },
+  });
+
   const saveAgent = useMutation({
     mutationFn: async () => {
       const currentAgent = agent;
@@ -153,10 +217,12 @@ export default function AgentDetailPage() {
           name: payload.name,
           prompt: payload.prompt,
           triggerType: payload.triggerType,
-          triggerConfig:
-            payload.triggerType === "SCHEDULED"
-              ? { ...(currentAgent.triggerConfig || {}), cron: payload.scheduleCron.trim() }
-              : undefined,
+          triggerConfig: mergeAgentTriggerConfig({
+            existingTriggerConfig: currentAgent.triggerConfig,
+            triggerType: payload.triggerType,
+            scheduleCron: payload.scheduleCron,
+            contextConfig: payload.contextConfig,
+          }),
           geminiModel: payload.geminiModel || null,
           webhookEnabled: payload.webhookEnabled,
           webhookUrl: payload.webhookEnabled ? payload.webhookUrl || null : null,
@@ -174,14 +240,29 @@ export default function AgentDetailPage() {
 
   const runAgent = useMutation({
     mutationFn: async () => {
+      const payload = draft || (agent ? toDraft(agent) : null);
+      if (!payload) {
+        throw new Error("Agent not loaded");
+      }
+
       const res = await fetch(`/api/projects/${projectId}/agents/${agentId}/run`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: payload.prompt,
+          geminiModel: payload.geminiModel || null,
+          contextConfig: payload.contextConfig,
+        }),
       });
-      if (!res.ok) throw new Error("Failed to run");
+      const json = await res.json();
+      if (!res.ok || !json.success) throw new Error(json.error || "Failed to run");
     },
     onSuccess: () => {
       toast.success("Agent run started");
       queryClient.invalidateQueries({ queryKey: ["agent", agentId] });
+    },
+    onError: (error: Error) => {
+      toast.error(error.message);
     },
   });
 
@@ -195,7 +276,7 @@ export default function AgentDetailPage() {
     },
   });
 
-  const selectedGeminiModel = draft?.geminiModel || agent?.geminiModel || "";
+  const selectedGeminiModel = activeDraft?.geminiModel || agent?.geminiModel || "";
 
   const modelOptions = useMemo(() => {
     const existingOptions = modelsQuery.data || [];
@@ -223,20 +304,26 @@ export default function AgentDetailPage() {
     );
   }
 
-  if (!agent) return null;
+  if (!agent || !activeDraft) return null;
 
-  const form = draft || toDraft(agent);
+  const form = activeDraft;
   const persistedScheduleCron =
     typeof agent.triggerConfig?.cron === "string"
       ? agent.triggerConfig.cron
       : typeof agent.triggerConfig?.schedule === "string"
         ? agent.triggerConfig.schedule
         : "0 2 * * *";
+  const persistedContextConfig = getAgentContextConfigFromTriggerConfig(agent.triggerConfig);
   const hasChanges =
     form.prompt !== agent.prompt ||
     form.name !== agent.name ||
     form.triggerType !== agent.triggerType ||
     form.scheduleCron !== persistedScheduleCron ||
+    form.contextConfig.includeProjectSummary !== persistedContextConfig.includeProjectSummary ||
+    form.contextConfig.includePageData !== persistedContextConfig.includePageData ||
+    form.contextConfig.includeExistingIssues !== persistedContextConfig.includeExistingIssues ||
+    form.contextConfig.includePreviousFindings !== persistedContextConfig.includePreviousFindings ||
+    form.contextConfig.includeLatestCrawlDelta !== persistedContextConfig.includeLatestCrawlDelta ||
     form.geminiModel !== (agent.geminiModel || "") ||
     form.webhookEnabled !== agent.webhookEnabled ||
     form.webhookUrl !== (agent.webhookUrl || "") ||
@@ -295,7 +382,12 @@ export default function AgentDetailPage() {
         {/* Prompt Editor (60%) */}
         <div className="lg:col-span-3 space-y-3">
           <div className="flex items-center justify-between">
-            <Label className="text-[#94A3B8] text-sm">System Prompt</Label>
+            <div>
+              <Label className="text-[#94A3B8] text-sm">System Prompt</Label>
+              <p className="mt-1 text-[11px] text-[#64748B]">
+                The next test run uses the prompt currently shown here, even before save.
+              </p>
+            </div>
             <span className="text-[10px] text-[#64748B]">{form.prompt.length} chars</span>
           </div>
           <div className="rounded-lg border border-[#1E293B] overflow-hidden h-[500px]">
@@ -318,6 +410,115 @@ export default function AgentDetailPage() {
               }}
             />
           </div>
+
+          <Card className="bg-[#111827] border-[#1E293B]">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-sm text-[#94A3B8]">Runtime Preview</CardTitle>
+              <p className="text-xs text-[#64748B]">
+                Inspect the exact prompt sections and site context that will be passed to the agent.
+              </p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {previewQuery.data && (
+                <div className="grid grid-cols-2 gap-2 lg:grid-cols-3">
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Site</p>
+                    <p className="mt-1 truncate text-xs text-[#F8FAFC]">{previewQuery.data.summary.siteUrl}</p>
+                  </div>
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Pages</p>
+                    <p className="mt-1 text-xs text-[#F8FAFC]">{previewQuery.data.summary.totalPages}</p>
+                  </div>
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Active Issues</p>
+                    <p className="mt-1 text-xs text-[#F8FAFC]">{previewQuery.data.summary.totalIssues}</p>
+                  </div>
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Previous Findings</p>
+                    <p className="mt-1 text-xs text-[#F8FAFC]">{previewQuery.data.summary.previousFindingsCount}</p>
+                  </div>
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Attached Skills</p>
+                    <p className="mt-1 text-xs text-[#F8FAFC]">{previewQuery.data.summary.attachedSkillsCount}</p>
+                  </div>
+                  <div className="rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wide text-[#64748B]">Model</p>
+                    <p className="mt-1 truncate text-xs text-[#F8FAFC]">
+                      {previewQuery.data.model || "Profile default"}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {previewQuery.isLoading && (
+                <div className="flex items-center gap-2 rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-3 text-xs text-[#94A3B8]">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Building runtime preview...
+                </div>
+              )}
+
+              {previewQuery.isError && (
+                <div className="rounded-md border border-red-500/20 bg-red-500/10 px-3 py-3 text-xs text-red-300">
+                  {previewQuery.error instanceof Error
+                    ? previewQuery.error.message
+                    : "Unable to load runtime preview"}
+                </div>
+              )}
+
+              {previewQuery.data && (
+                <Tabs defaultValue="sections" className="gap-3">
+                  <TabsList className="bg-[#0A0F1C]">
+                    <TabsTrigger value="sections">Sections</TabsTrigger>
+                    <TabsTrigger value="full-prompt">Full Prompt</TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="sections">
+                    <ScrollArea className="h-[360px] rounded-md border border-[#1E293B] bg-[#0A0F1C]">
+                      <Accordion className="px-3 py-2">
+                        {previewQuery.data.sections.map((section) => (
+                          <AccordionItem key={section.key} value={section.key} className="border-[#1E293B]">
+                            <AccordionTrigger className="hover:no-underline py-3">
+                              <div className="flex flex-wrap items-center gap-2 text-left">
+                                <span className="text-xs text-[#F8FAFC]">{section.title}</span>
+                                <Badge
+                                  variant="outline"
+                                  className={section.included && section.available
+                                    ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
+                                    : "border-[#334155] bg-[#111827] text-[#64748B]"}
+                                >
+                                  {section.included && section.available ? "Included" : "Excluded"}
+                                </Badge>
+                                {typeof section.itemCount === "number" && (
+                                  <Badge
+                                    variant="outline"
+                                    className="border-[#334155] bg-[#111827] text-[#64748B]"
+                                  >
+                                    {section.itemCount} items
+                                  </Badge>
+                                )}
+                              </div>
+                            </AccordionTrigger>
+                            <AccordionContent className="space-y-3 pb-4">
+                              <p className="text-xs text-[#64748B]">{section.description}</p>
+                              <pre className="overflow-x-auto whitespace-pre-wrap rounded-md border border-[#1E293B] bg-[#111827] p-3 text-[11px] leading-5 text-[#CBD5E1]">
+                                {section.available ? section.content : "No data available for this section yet."}
+                              </pre>
+                            </AccordionContent>
+                          </AccordionItem>
+                        ))}
+                      </Accordion>
+                    </ScrollArea>
+                  </TabsContent>
+                  <TabsContent value="full-prompt">
+                    <ScrollArea className="h-[360px] rounded-md border border-[#1E293B] bg-[#0A0F1C]">
+                      <pre className="whitespace-pre-wrap p-4 text-[11px] leading-5 text-[#CBD5E1]">
+                        {previewQuery.data.fullPrompt}
+                      </pre>
+                    </ScrollArea>
+                  </TabsContent>
+                </Tabs>
+              )}
+            </CardContent>
+          </Card>
         </div>
 
         {/* Configuration Panel (40%) */}
@@ -395,6 +596,66 @@ export default function AgentDetailPage() {
                   </div>
                 </div>
               )}
+            </CardContent>
+          </Card>
+
+          <Card className="bg-[#111827] border-[#1E293B]">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-sm text-[#94A3B8]">Runtime Context</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {[
+                {
+                  key: "includeProjectSummary" as const,
+                  label: "Project summary",
+                  description: "Site URL, total pages, issue count, and health score.",
+                },
+                {
+                  key: "includePageData" as const,
+                  label: "Page data",
+                  description: "Per-page crawl data including titles, canonicals, links, and image counts.",
+                },
+                {
+                  key: "includeExistingIssues" as const,
+                  label: "Existing audit findings",
+                  description: "Deterministic issue data used as baseline evidence.",
+                },
+                {
+                  key: "includePreviousFindings" as const,
+                  label: "Previous agent findings",
+                  description: "Last successful run output for delta analysis and de-duplication.",
+                },
+                {
+                  key: "includeLatestCrawlDelta" as const,
+                  label: "Latest crawl delta",
+                  description: "URL diff plus newly found, resolved, and persisted issues from the most recent completed crawl.",
+                },
+              ].map((item) => (
+                <div
+                  key={item.key}
+                  className="flex items-start justify-between gap-3 rounded-md border border-[#1E293B] bg-[#0A0F1C] px-3 py-2"
+                >
+                  <div className="space-y-1">
+                    <p className="text-xs text-[#F8FAFC]">{item.label}</p>
+                    <p className="text-[11px] leading-4 text-[#64748B]">{item.description}</p>
+                  </div>
+                  <Switch
+                    checked={form.contextConfig[item.key]}
+                    onCheckedChange={(checked) =>
+                      setDraft((prev) => ({
+                        ...(prev || toDraft(agent)),
+                        contextConfig: {
+                          ...(prev || toDraft(agent)).contextConfig,
+                          [item.key]: checked,
+                        },
+                      }))
+                    }
+                  />
+                </div>
+              ))}
+              <p className="text-[11px] text-[#64748B]">
+                These toggles affect both the preview below and the next test run payload.
+              </p>
             </CardContent>
           </Card>
 

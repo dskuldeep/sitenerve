@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   FolderKanban,
@@ -15,6 +16,13 @@ import { CardSkeleton } from "@/components/shared/loading-skeleton";
 import { ProjectCard } from "@/components/projects/project-card";
 import { CreateProjectDialog } from "@/components/projects/create-project-dialog";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { formatDistanceToNow } from "date-fns";
 import {
   BarChart,
@@ -60,7 +68,7 @@ interface DashboardMetrics {
   }>;
   healthScoreTrend: Array<{
     date: string;
-    score: number;
+    score: number | null;
   }>;
 }
 
@@ -100,6 +108,8 @@ function CustomTooltip({
 }
 
 export default function DashboardPage() {
+  const [selectedProjectId, setSelectedProjectId] = useState("ALL");
+
   const { data: projects = [], isLoading } = useQuery<Project[]>({
     queryKey: ["projects"],
     queryFn: async () => {
@@ -118,10 +128,19 @@ export default function DashboardPage() {
     },
   });
 
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId]
+  );
+
   const { data: metrics } = useQuery<DashboardMetrics>({
-    queryKey: ["dashboard-metrics"],
+    queryKey: ["dashboard-metrics", selectedProjectId],
     queryFn: async () => {
-      const res = await fetch("/api/dashboard/metrics");
+      const query =
+        selectedProjectId !== "ALL"
+          ? `?projectId=${encodeURIComponent(selectedProjectId)}`
+          : "";
+      const res = await fetch(`/api/dashboard/metrics${query}`);
       const json = await res.json();
       return json.success
         ? json.data
@@ -202,10 +221,31 @@ export default function DashboardPage() {
         {/* Issues by Severity - Stacked Bar Chart */}
         <Card className="bg-[#111827] border-[#1E293B]">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-[#94A3B8]">
-              Issues by Severity
-            </CardTitle>
-            <p className="text-xs text-[#64748B]">Last 7 days</p>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <CardTitle className="text-sm font-medium text-[#94A3B8]">
+                  Issues by Severity
+                </CardTitle>
+                <p className="text-xs text-[#64748B]">
+                  Last 7 days for {selectedProject ? selectedProject.name : "all projects"}
+                </p>
+              </div>
+              <Select value={selectedProjectId} onValueChange={(value) => value && setSelectedProjectId(value)}>
+                <SelectTrigger className="w-[180px] bg-[#111827] border-[#1E293B] text-[#F8FAFC] text-sm h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-[#111827] border-[#1E293B]">
+                  <SelectItem value="ALL" className="text-[#94A3B8]">
+                    All projects
+                  </SelectItem>
+                  {projects.map((project) => (
+                    <SelectItem key={project.id} value={project.id} className="text-[#94A3B8]">
+                      {project.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </CardHeader>
           <CardContent className="pb-4">
             {(metrics?.issuesBySeverity?.length ?? 0) === 0 ? (
@@ -292,7 +332,9 @@ export default function DashboardPage() {
             <CardTitle className="text-sm font-medium text-[#94A3B8]">
               Health Score Trend
             </CardTitle>
-            <p className="text-xs text-[#64748B]">Based on recent crawls</p>
+            <p className="text-xs text-[#64748B]">
+              Daily crawl history for {selectedProject ? selectedProject.name : "all projects"}
+            </p>
           </CardHeader>
           <CardContent className="pb-4">
             {(metrics?.healthScoreTrend?.length ?? 0) === 0 ? (

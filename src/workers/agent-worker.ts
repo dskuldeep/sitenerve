@@ -1,22 +1,22 @@
-import { Worker } from "bullmq";
+import { Worker, type ConnectionOptions } from "bullmq";
 import IORedis from "ioredis";
 
 const connection = new IORedis(process.env.REDIS_URL || "redis://localhost:6379", {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
-}) as any;
+}) as unknown as ConnectionOptions;
 
 
 const agentWorker = new Worker(
   "agent-queue",
   async (job) => {
-    const { agentId, triggeredBy } = job.data;
+    const { agentId, triggeredBy, runtimeOverrides } = job.data;
     const triggerLabel = triggeredBy || "MANUAL";
     console.log(`[Agent Worker] Starting agent execution for ${agentId} (trigger: ${triggerLabel})`);
 
     const { executeAgent } = await import("@/services/agents/executor");
 
-    const runId = await executeAgent(agentId);
+    const runId = await executeAgent(agentId, runtimeOverrides);
 
     console.log(`[Agent Worker] Agent execution completed, run: ${runId}`);
 

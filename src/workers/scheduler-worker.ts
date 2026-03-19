@@ -162,7 +162,7 @@ async function enqueueDueScheduledAgents(now: Date): Promise<number> {
   return enqueued;
 }
 
-async function shouldDeferSchedulerTick(): Promise<boolean> {
+async function shouldDeferScheduledCrawls(): Promise<boolean> {
   const [activeCrawls, activePostCrawls] = await Promise.all([
     crawlQueue.getActiveCount(),
     postCrawlQueue.getActiveCount(),
@@ -176,18 +176,17 @@ export async function runSchedulerTick(reason: "startup" | "interval" = "interva
   isTickInProgress = true;
 
   try {
-    if (await shouldDeferSchedulerTick()) {
-      if (reason === "interval") {
-        console.log("[Scheduler] Deferring tick while crawl/post-crawl work is active");
-      }
-      return;
-    }
-
     const now = new Date();
+    const deferScheduledCrawls = await shouldDeferScheduledCrawls();
+
     const [scheduledCrawls, scheduledAgents] = await Promise.all([
-      enqueueDueScheduledCrawls(now),
+      deferScheduledCrawls ? Promise.resolve(0) : enqueueDueScheduledCrawls(now),
       enqueueDueScheduledAgents(now),
     ]);
+
+    if (deferScheduledCrawls && reason === "interval") {
+      console.log("[Scheduler] Deferring scheduled crawl enqueue while crawl/post-crawl work is active");
+    }
 
     if (scheduledCrawls > 0 || scheduledAgents > 0) {
       console.log(

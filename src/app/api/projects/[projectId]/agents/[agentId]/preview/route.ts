@@ -2,9 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import {
+  getAgentPromptPreviewPayload,
+  resolveAgentRuntime,
+} from "@/services/agents/runtime";
 import { normalizeAgentContextConfig } from "@/types/agents";
 
-const runAgentSchema = z.object({
+const previewSchema = z.object({
   prompt: z.string().min(1).optional(),
   geminiModel: z.string().min(1).nullable().optional(),
   contextConfig: z.object({
@@ -24,6 +28,7 @@ export async function POST(
   if (!session?.user?.id) {
     return NextResponse.json({ success: false, error: "Unauthorized" }, { status: 401 });
   }
+
   const { projectId, agentId } = await params;
 
   const project = await prisma.project.findFirst({
@@ -34,20 +39,8 @@ export async function POST(
     return NextResponse.json({ success: false, error: "Project not found" }, { status: 404 });
   }
 
-  const agent = await prisma.agent.findFirst({
-    where: { id: agentId, projectId },
-  });
-  if (!agent) {
-    return NextResponse.json({ success: false, error: "Agent not found" }, { status: 404 });
-  }
-
-  let payload: unknown = {};
-  const contentType = req.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    payload = await req.json();
-  }
-
-  const parsed = runAgentSchema.safeParse(payload);
+  const body = await req.json();
+  const parsed = previewSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
       { success: false, error: parsed.error.issues[0].message },
@@ -55,40 +48,26 @@ export async function POST(
     );
   }
 
-  const runtimeOverrides = {
+  const agent = await prisma.agent.findFirst({
+    where: { id: agentId, projectId },
+    select: { id: true },
+  });
+  if (!agent) {
+    return NextResponse.json({ success: false, error: "Agent not found" }, { status: 404 });
+  }
+
+  const runtime = await resolveAgentRuntime(agentId, {
     ...parsed.data,
     contextConfig: parsed.data.contextConfig
       ? normalizeAgentContextConfig(parsed.data.contextConfig)
       : undefined,
-  };
-
-  await prisma.agent.update({
-    where: { id: agentId },
-    data: {
-      lastRunAt: new Date(),
-      lastRunStatus: "RUNNING",
-    },
   });
 
-  try {
-    const { agentQueue } = await import("@/lib/queue");
-    await agentQueue.add("agent-run", { agentId, projectId, runtimeOverrides });
-
-    return NextResponse.json({
-      success: true,
-      message: "Agent run enqueued",
-    });
-  } catch {
-    // If Redis not available, run inline
-    try {
-      const { executeAgent } = await import("@/services/agents/executor");
-      const runId = await executeAgent(agentId, runtimeOverrides);
-      return NextResponse.json({ success: true, data: { runId } });
-    } catch {
-      return NextResponse.json(
-        { success: false, error: "Failed to execute agent" },
-        { status: 500 }
-      );
-    }
-  }
+  return NextResponse.json({
+    success: true,
+    data: {
+      ...getAgentPromptPreviewPayload(runtime),
+      model: runtime.model,
+    },
+  });
 }

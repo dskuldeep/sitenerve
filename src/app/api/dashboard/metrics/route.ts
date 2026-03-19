@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 
@@ -12,7 +12,7 @@ interface IssuesBySeverityPoint {
 
 interface HealthScorePoint {
   date: string;
-  score: number;
+  score: number | null;
 }
 
 function startOfDay(date: Date): Date {
@@ -37,35 +37,70 @@ function dateLabel(date: Date): string {
   return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-export async function GET() {
+function extractHealthScore(diff: unknown): number | null {
+  if (!diff || typeof diff !== "object" || Array.isArray(diff)) return null;
+
+  const postProcessing = (diff as Record<string, unknown>).postProcessing;
+  if (
+    !postProcessing ||
+    typeof postProcessing !== "object" ||
+    Array.isArray(postProcessing)
+  ) {
+    return null;
+  }
+
+  const healthScore = (postProcessing as Record<string, unknown>).healthScore;
+  return typeof healthScore === "number" && Number.isFinite(healthScore) ? healthScore : null;
+}
+
+export async function GET(req: NextRequest) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ success: false, error: "Unauthorized" }, { status: 401 });
   }
 
+  const selectedProjectId = req.nextUrl.searchParams.get("projectId")?.trim() || null;
   const today = startOfDay(new Date());
   const windowStart = addDays(today, -6);
+  const projectWhere = selectedProjectId
+    ? { id: selectedProjectId, userId: session.user.id }
+    : { userId: session.user.id };
 
-  const [recentIssues, projectsWithCrawl] = await Promise.all([
+  if (selectedProjectId) {
+    const project = await prisma.project.findFirst({
+      where: { id: selectedProjectId, userId: session.user.id },
+      select: { id: true },
+    });
+
+    if (!project) {
+      return NextResponse.json({ success: false, error: "Project not found" }, { status: 404 });
+    }
+  }
+
+  const [recentIssues, recentCrawls] = await Promise.all([
     prisma.issue.findMany({
       where: {
-        project: { userId: session.user.id },
-        firstDetectedAt: { gte: windowStart },
+        project: projectWhere,
+        status: { in: ["ACTIVE", "WHITELISTED"] },
+        lastDetectedAt: { gte: windowStart },
       },
       select: {
         severity: true,
-        firstDetectedAt: true,
+        lastDetectedAt: true,
       },
     }),
-    prisma.project.findMany({
+    prisma.crawl.findMany({
       where: {
-        userId: session.user.id,
-        lastCrawlAt: { gte: windowStart },
+        project: projectWhere,
+        status: "COMPLETED",
+        completedAt: { gte: windowStart },
       },
       select: {
-        healthScore: true,
-        lastCrawlAt: true,
+        projectId: true,
+        completedAt: true,
+        diff: true,
       },
+      orderBy: { completedAt: "asc" },
     }),
   ]);
 
@@ -83,7 +118,7 @@ export async function GET() {
 
   let issueTotal = 0;
   for (const issue of recentIssues) {
-    const key = dateKey(issue.firstDetectedAt);
+    const key = dateKey(issue.lastDetectedAt);
     const bucket = issueBuckets.get(key);
     if (!bucket) continue;
 
@@ -94,29 +129,45 @@ export async function GET() {
     issueTotal += 1;
   }
 
-  const healthAggregate = new Map<string, { sum: number; count: number; label: string }>();
-  for (const project of projectsWithCrawl) {
-    if (!project.lastCrawlAt) continue;
-    const key = dateKey(project.lastCrawlAt);
-    const label = dateLabel(project.lastCrawlAt);
-    const aggregate = healthAggregate.get(key) ?? { sum: 0, count: 0, label };
-    aggregate.sum += project.healthScore;
+  const healthAggregate = new Map<string, { sum: number; count: number }>();
+  for (const crawl of recentCrawls) {
+    if (!crawl.completedAt) continue;
+    const healthScore = extractHealthScore(crawl.diff);
+    if (healthScore === null) continue;
+
+    const key = dateKey(crawl.completedAt);
+    const aggregate = healthAggregate.get(key) ?? { sum: 0, count: 0 };
+    aggregate.sum += healthScore;
     aggregate.count += 1;
     healthAggregate.set(key, aggregate);
   }
 
-  const healthScoreTrend: HealthScorePoint[] = Array.from(healthAggregate.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([, value]) => ({
-      date: value.label,
-      score: Math.round((value.sum / value.count) * 10) / 10,
-    }));
+  const healthScoreTrend: HealthScorePoint[] = [];
+  let healthPointCount = 0;
+  for (let i = 0; i < 7; i += 1) {
+    const day = addDays(windowStart, i);
+    const key = dateKey(day);
+    const aggregate = healthAggregate.get(key);
+    const score =
+      aggregate && aggregate.count > 0
+        ? Math.round((aggregate.sum / aggregate.count) * 10) / 10
+        : null;
+
+    if (score !== null) {
+      healthPointCount += 1;
+    }
+
+    healthScoreTrend.push({
+      date: dateLabel(day),
+      score,
+    });
+  }
 
   return NextResponse.json({
     success: true,
     data: {
       issuesBySeverity: issueTotal > 0 ? Array.from(issueBuckets.values()) : [],
-      healthScoreTrend,
+      healthScoreTrend: healthPointCount > 0 ? healthScoreTrend : [],
     },
   });
 }

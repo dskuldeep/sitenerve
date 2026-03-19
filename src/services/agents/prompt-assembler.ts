@@ -1,9 +1,63 @@
+import {
+  normalizeAgentContextConfig,
+  type AgentContextConfig,
+} from "@/types/agents";
+
 export interface ProjectContext {
   projectId: string;
   siteUrl: string;
   totalPages: number;
   totalIssues: number;
   healthScore: number;
+  latestCrawlDelta: {
+    available: boolean;
+    crawlId: string | null;
+    crawlCompletedAt: string | null;
+    isInitialCrawl: boolean;
+    urlDiff: {
+      totalPages: number;
+      newPagesCount: number;
+      removedPagesCount: number;
+      changedPagesCount: number;
+      newPages: string[];
+      removedPages: string[];
+      changedPages: Array<{
+        url: string;
+        changes: Array<{
+          field: string;
+          oldValue: unknown;
+          newValue: unknown;
+        }>;
+      }>;
+    };
+    issueDiff: {
+      newIssuesCount: number;
+      resolvedIssuesCount: number;
+      persistedIssuesCount: number;
+      activeIssuesAfterCrawl: number | null;
+      newIssues: Array<{
+        ruleId: string;
+        severity: string;
+        title: string;
+        affectedUrl: string;
+        firstDetectedAt: string;
+      }>;
+      resolvedIssues: Array<{
+        ruleId: string;
+        severity: string;
+        title: string;
+        affectedUrl: string;
+        resolvedAt: string | null;
+      }>;
+      persistedIssues: Array<{
+        ruleId: string;
+        severity: string;
+        title: string;
+        affectedUrl: string;
+        lastDetectedAt: string;
+      }>;
+    };
+  };
   pages: Array<{
     url: string;
     statusCode: number | null;
@@ -31,39 +85,76 @@ export interface ProjectContext {
   }>;
 }
 
-export function assemblePrompt(config: {
+export interface AgentPromptSection {
+  key:
+    | "agent-instructions"
+    | "additional-skills"
+    | "project-summary"
+    | "page-data"
+    | "existing-issues"
+    | "previous-findings"
+    | "latest-crawl-delta"
+    | "output-format";
+  title: string;
+  description: string;
+  content: string;
+  included: boolean;
+  available: boolean;
+  itemCount?: number;
+}
+
+export function buildPromptSections(config: {
   prompt: string;
   skills: string[];
   context: ProjectContext;
   previousFindings?: Array<{ title: string; severity: string; type: string; status: string }>;
-}): string {
+  contextConfig?: AgentContextConfig;
+}): AgentPromptSection[] {
   const { prompt, skills, context, previousFindings } = config;
+  const contextConfig = normalizeAgentContextConfig(config.contextConfig);
+  const sections: AgentPromptSection[] = [];
 
-  const sections: string[] = [];
+  sections.push({
+    key: "agent-instructions",
+    title: "Agent Instructions",
+    description: "The editable system prompt for this agent.",
+    content: prompt,
+    included: true,
+    available: true,
+  });
 
-  // System prompt (the agent's core instructions)
-  sections.push(`## Agent Instructions\n\n${prompt}`);
-
-  // Skill definitions (additional capabilities injected from skills.sh)
   if (skills.length > 0) {
-    sections.push(`## Additional Skills\n\n${skills.join("\n\n---\n\n")}`);
+    sections.push({
+      key: "additional-skills",
+      title: "Additional Skills",
+      description: "Attached skill definitions injected ahead of the site data.",
+      content: skills.join("\n\n---\n\n"),
+      included: true,
+      available: true,
+      itemCount: skills.length,
+    });
   }
 
-  // Project context
-  sections.push(
-    `## Project Context\n\n` +
+  sections.push({
+    key: "project-summary",
+    title: "Project Context",
+    description: "High-level project metrics that anchor the analysis.",
+    content:
       `- **Site URL:** ${context.siteUrl}\n` +
       `- **Total Pages:** ${context.totalPages}\n` +
       `- **Total Active Issues:** ${context.totalIssues}\n` +
-      `- **Health Score:** ${context.healthScore}/100\n`
-  );
+      `- **Health Score:** ${context.healthScore}/100\n`,
+    included: contextConfig.includeProjectSummary,
+    available: true,
+  });
 
-  // Page data (truncated for token budget)
   const maxPages = 200;
   const pagesToInclude = context.pages.slice(0, maxPages);
-
-  sections.push(
-    `## Page Data (${pagesToInclude.length} of ${context.pages.length} pages)\n\n` +
+  sections.push({
+    key: "page-data",
+    title: `Page Data (${pagesToInclude.length} of ${context.pages.length} pages)`,
+    description: "Per-page crawl data, truncated for token budget control.",
+    content:
       "```json\n" +
       JSON.stringify(
         pagesToInclude.map((p) => ({
@@ -88,10 +179,12 @@ export function assemblePrompt(config: {
         null,
         2
       ) +
-      "\n```"
-  );
+      "\n```",
+    included: contextConfig.includePageData,
+    available: context.pages.length > 0,
+    itemCount: context.pages.length,
+  });
 
-  // Existing issues for context (avoid duplicate findings)
   if (context.issues.length > 0) {
     const issueSummary = context.issues.reduce<Record<string, number>>((acc, issue) => {
       const key = `${issue.category}:${issue.severity}`;
@@ -101,25 +194,34 @@ export function assemblePrompt(config: {
 
     const issuesToInclude = context.issues.slice(0, 500);
 
-    sections.push(
-      `## Full Site Audit Context\n\n` +
+    sections.push({
+      key: "existing-issues",
+      title: `Full Site Audit Context (${issuesToInclude.length} of ${context.issues.length})`,
+      description:
+        "Deterministic audit findings passed as baseline evidence to avoid duplicate analysis.",
+      content:
         `The deterministic audit detected ${context.issues.length} active issues across the site.\n\n` +
         "### Audit Summary by Category/Severity\n" +
         "```json\n" +
         JSON.stringify(issueSummary, null, 2) +
         "\n```\n\n" +
-        `### Audit Findings (${issuesToInclude.length} of ${context.issues.length})\n` +
+        "### Audit Findings\n" +
         "Use this as baseline evidence. Your output should add prioritization, root-cause patterns, and implementation-ready remediations.\n\n" +
         "```json\n" +
         JSON.stringify(issuesToInclude, null, 2) +
-        "\n```"
-    );
+        "\n```",
+      included: contextConfig.includeExistingIssues,
+      available: true,
+      itemCount: context.issues.length,
+    });
   }
 
-  // Previous findings for delta analysis
   if (previousFindings && previousFindings.length > 0) {
-    sections.push(
-      `## Your Previous Findings (${previousFindings.length})\n\n` +
+    sections.push({
+      key: "previous-findings",
+      title: `Your Previous Findings (${previousFindings.length})`,
+      description: "Last successful run findings used for delta analysis and de-duplication.",
+      content:
         "These are the findings from your last run. Use them for delta analysis:\n" +
         "- Flag which previous issues PERSIST (still present in the data)\n" +
         "- Flag which previous issues are RESOLVED (no longer supported by data)\n" +
@@ -127,13 +229,39 @@ export function assemblePrompt(config: {
         "- If a finding persists with stronger evidence, increase your confidence score\n\n" +
         "```json\n" +
         JSON.stringify(previousFindings, null, 2) +
-        "\n```"
-    );
+        "\n```",
+      included: contextConfig.includePreviousFindings,
+      available: true,
+      itemCount: previousFindings.length,
+    });
   }
 
-  // Structured output instructions
-  sections.push(
-    `## Output Format\n\n` +
+  sections.push({
+    key: "latest-crawl-delta",
+    title: context.latestCrawlDelta.isInitialCrawl
+      ? "Latest Crawl Delta (Initial Baseline)"
+      : "Latest Crawl Delta",
+    description: context.latestCrawlDelta.available
+      ? "Net URL and issue changes from the most recent completed crawl."
+      : "No completed crawl is available yet, so there is no crawl delta context to inject.",
+    content: context.latestCrawlDelta.available
+      ? "```json\n" + JSON.stringify(context.latestCrawlDelta, null, 2) + "\n```"
+      : "No completed crawl is available yet for this project.",
+    included: contextConfig.includeLatestCrawlDelta,
+    available: context.latestCrawlDelta.available,
+    itemCount:
+      context.latestCrawlDelta.urlDiff.newPagesCount +
+      context.latestCrawlDelta.urlDiff.removedPagesCount +
+      context.latestCrawlDelta.urlDiff.changedPagesCount +
+      context.latestCrawlDelta.issueDiff.newIssuesCount +
+      context.latestCrawlDelta.issueDiff.resolvedIssuesCount,
+  });
+
+  sections.push({
+    key: "output-format",
+    title: "Output Format",
+    description: "Structured JSON contract and quality bar enforced for every run.",
+    content:
       "You MUST respond with ONLY a valid JSON array. Do not include any text before or after the JSON.\n\n" +
       "Each element in the array must be an object with these fields:\n" +
       '- `type` (string): One of "issue", "recommendation", or "observation"\n' +
@@ -167,8 +295,23 @@ export function assemblePrompt(config: {
         null,
         2
       ) +
-      "\n```"
-  );
+      "\n```",
+    included: true,
+    available: true,
+  });
 
-  return sections.join("\n\n---\n\n");
+  return sections;
+}
+
+export function assemblePrompt(config: {
+  prompt: string;
+  skills: string[];
+  context: ProjectContext;
+  previousFindings?: Array<{ title: string; severity: string; type: string; status: string }>;
+  contextConfig?: AgentContextConfig;
+}): string {
+  return buildPromptSections(config)
+    .filter((section) => section.included && section.available)
+    .map((section) => `## ${section.title}\n\n${section.content}`)
+    .join("\n\n---\n\n");
 }

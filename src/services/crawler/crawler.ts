@@ -51,7 +51,42 @@ const EXTERNAL_LINK_CHECK_MAX = 1200;
 const EXTERNAL_LINK_CHECK_CONCURRENCY = 20;
 const EXTERNAL_LINK_CHECK_TIMEOUT_MS = 10000;
 const EXTERNAL_LINK_MAX_REDIRECTS = 8;
-const PAGE_UPSERT_CONCURRENCY = 25;
+const PRISMA_RETRY_ATTEMPTS = 5;
+const PRISMA_RETRY_BASE_DELAY_MS = 1000;
+const DEFAULT_PAGE_UPSERT_CONCURRENCY = 8;
+const NON_HTML_RESOURCE_EXTENSIONS = new Set([
+  ".txt",
+  ".xml",
+  ".json",
+  ".rss",
+  ".atom",
+  ".pdf",
+  ".csv",
+  ".zip",
+  ".gz",
+  ".svg",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".ico",
+  ".css",
+  ".js",
+  ".mjs",
+  ".cjs",
+  ".map",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".eot",
+  ".mp3",
+  ".mp4",
+  ".webm",
+  ".mov",
+  ".avi",
+  ".m4a",
+]);
 
 class CrawlCancelledError extends Error {
   constructor(message: string = "Crawl cancelled by user") {
@@ -71,6 +106,96 @@ function normalizeCrawlUrl(url: string): string {
   }
   parsed.hash = "";
   return parsed.href;
+}
+
+function parsePositiveInteger(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryablePrismaConnectionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+
+  const maybeError = error as { code?: unknown; message?: unknown };
+  const code = typeof maybeError.code === "string" ? maybeError.code : "";
+  const message =
+    typeof maybeError.message === "string"
+      ? maybeError.message.toLowerCase()
+      : error instanceof Error
+        ? error.message.toLowerCase()
+        : "";
+
+  return (
+    code === "P1001" ||
+    code === "P1002" ||
+    code === "P1017" ||
+    code === "P2024" ||
+    message.includes("can't reach database server") ||
+    message.includes("timed out fetching a new connection") ||
+    message.includes("closed the connection") ||
+    message.includes("server has closed the connection") ||
+    message.includes("connection terminated") ||
+    message.includes("connection reset")
+  );
+}
+
+async function withPrismaRetry<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; attempt <= PRISMA_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const shouldRetry =
+        attempt < PRISMA_RETRY_ATTEMPTS && isRetryablePrismaConnectionError(error);
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      const backoffMs = attempt * PRISMA_RETRY_BASE_DELAY_MS;
+      const reason = error instanceof Error ? error.message : "Unknown Prisma error";
+      console.warn(
+        `[Crawler] ${label} hit a transient database error (${reason}). Retrying in ${backoffMs}ms...`
+      );
+
+      await prisma.$disconnect().catch(() => undefined);
+      await wait(backoffMs);
+      await prisma.$connect().catch((connectError) => {
+        const message =
+          connectError instanceof Error ? connectError.message : "Unknown reconnect error";
+        console.warn(`[Crawler] Prisma reconnect attempt failed: ${message}`);
+      });
+    }
+  }
+
+  throw new Error(`[Crawler] ${label} failed after exhausting Prisma retries`);
+}
+
+function getPageUpsertConcurrency(): number {
+  const connectionLimit = parsePositiveInteger(process.env.PRISMA_CONNECTION_LIMIT);
+  if (!connectionLimit) {
+    return DEFAULT_PAGE_UPSERT_CONCURRENCY;
+  }
+
+  return Math.max(1, Math.min(DEFAULT_PAGE_UPSERT_CONCURRENCY, connectionLimit - 2));
+}
+
+function isLikelyHtmlPage(url: string): boolean {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    if (!pathname || pathname.endsWith("/")) return true;
+
+    const lastSegment = pathname.split("/").pop() || "";
+    if (!lastSegment.includes(".")) return true;
+
+    const extension = lastSegment.slice(lastSegment.lastIndexOf("."));
+    return !NON_HTML_RESOURCE_EXTENSIONS.has(extension);
+  } catch {
+    return false;
+  }
 }
 
 function buildContentHash(snapshot: Omit<PageSnapshot, "contentHash">): string {
@@ -137,59 +262,67 @@ async function syncCoverageIssue(input: {
   evidence: Record<string, unknown>;
   hasIssue: boolean;
 }): Promise<void> {
-  const existing = await prisma.issue.findFirst({
-    where: {
-      projectId: input.projectId,
-      ruleId: input.ruleId,
-      status: { not: "RESOLVED" },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const existing = await withPrismaRetry(`Loading coverage issue ${input.ruleId}`, () =>
+    prisma.issue.findFirst({
+      where: {
+        projectId: input.projectId,
+        ruleId: input.ruleId,
+        status: { not: "RESOLVED" },
+      },
+      orderBy: { createdAt: "desc" },
+    })
+  );
 
   if (!input.hasIssue) {
     if (existing) {
-      await prisma.issue.updateMany({
-        where: {
-          projectId: input.projectId,
-          ruleId: input.ruleId,
-          status: { not: "RESOLVED" },
-        },
-        data: {
-          status: "RESOLVED",
-          resolvedAt: new Date(),
-        },
-      });
+      await withPrismaRetry(`Resolving coverage issue ${input.ruleId}`, () =>
+        prisma.issue.updateMany({
+          where: {
+            projectId: input.projectId,
+            ruleId: input.ruleId,
+            status: { not: "RESOLVED" },
+          },
+          data: {
+            status: "RESOLVED",
+            resolvedAt: new Date(),
+          },
+        })
+      );
     }
     return;
   }
 
   if (existing) {
-    await prisma.issue.update({
-      where: { id: existing.id },
-      data: {
-        title: input.title,
-        description: input.description,
-        severity: input.severity,
-        evidence: toInputJsonValue(input.evidence),
-        lastDetectedAt: new Date(),
-        resolvedAt: null,
-      },
-    });
+    await withPrismaRetry(`Updating coverage issue ${input.ruleId}`, () =>
+      prisma.issue.update({
+        where: { id: existing.id },
+        data: {
+          title: input.title,
+          description: input.description,
+          severity: input.severity,
+          evidence: toInputJsonValue(input.evidence),
+          lastDetectedAt: new Date(),
+          resolvedAt: null,
+        },
+      })
+    );
     return;
   }
 
-  await prisma.issue.create({
-    data: {
-      projectId: input.projectId,
-      ruleId: input.ruleId,
-      category: "CRAWLABILITY",
-      severity: input.severity,
-      title: input.title,
-      description: input.description,
-      affectedUrl: input.siteUrl,
-      evidence: toInputJsonValue(input.evidence),
-    },
-  });
+  await withPrismaRetry(`Creating coverage issue ${input.ruleId}`, () =>
+    prisma.issue.create({
+      data: {
+        projectId: input.projectId,
+        ruleId: input.ruleId,
+        category: "CRAWLABILITY",
+        severity: input.severity,
+        title: input.title,
+        description: input.description,
+        affectedUrl: input.siteUrl,
+        evidence: toInputJsonValue(input.evidence),
+      },
+    })
+  );
 }
 
 interface ExternalLinkCheckResult {
@@ -377,37 +510,45 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
   const crawlSiteUrl = normalizeCrawlUrl(siteUrl);
 
   // Create crawl record
-  const crawl = await prisma.crawl.create({
-    data: {
-      projectId,
-      status: "RUNNING",
-      startedAt: new Date(),
-    },
-  });
+  const crawl = await withPrismaRetry("Creating crawl record", () =>
+    prisma.crawl.create({
+      data: {
+        projectId,
+        status: "RUNNING",
+        startedAt: new Date(),
+      },
+    })
+  );
 
   // Update project status
-  await prisma.project.update({
-    where: { id: projectId },
-    data: { status: "CRAWLING" },
-  });
+  await withPrismaRetry(`Updating project ${projectId} status to CRAWLING`, () =>
+    prisma.project.update({
+      where: { id: projectId },
+      data: { status: "CRAWLING" },
+    })
+  );
 
-  const previousPages = await prisma.page.findMany({
-    where: { projectId },
-    select: {
-      url: true,
-      title: true,
-      metaDescription: true,
-      statusCode: true,
-      h1: true,
-      wordCount: true,
-    },
-  });
+  const previousPages = await withPrismaRetry(`Loading previous pages for ${projectId}`, () =>
+    prisma.page.findMany({
+      where: { projectId },
+      select: {
+        url: true,
+        title: true,
+        metaDescription: true,
+        statusCode: true,
+        h1: true,
+        wordCount: true,
+      },
+    })
+  );
   const previousSnapshots = previousPages.map(toSnapshot);
 
-  const projectConfig = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { sitemapUrl: true },
-  });
+  const projectConfig = await withPrismaRetry(`Loading project config for ${projectId}`, () =>
+    prisma.project.findUnique({
+      where: { id: projectId },
+      select: { sitemapUrl: true },
+    })
+  );
 
   const robotsParser = new RobotsParser();
   await robotsParser.fetch(crawlSiteUrl);
@@ -421,7 +562,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
     robotsSitemaps,
     userProvidedSitemap: configuredSitemapUrl,
   });
-  const sitemapPageUrls = sitemapResult.pageUrls
+  const crawlableSitemapPageUrls = sitemapResult.pageUrls
     .map((url) => {
       try {
         return normalizeCrawlUrl(url);
@@ -436,12 +577,13 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
       } catch {
         return false;
       }
-    });
+    })
+    .filter((url) => isLikelyHtmlPage(url));
   const sitemapNotConfigured = sitemapResult.sitemapUrlsDiscovered.length === 0;
 
   const normalizedSiteUrl = normalizeCrawlUrl(crawlSiteUrl);
   const seedUrls = new Set<string>([normalizedSiteUrl]);
-  for (const sitemapPageUrl of sitemapPageUrls) {
+  for (const sitemapPageUrl of crawlableSitemapPageUrls) {
     if (seedUrls.size >= maxPages) break;
     seedUrls.add(sitemapPageUrl);
   }
@@ -597,7 +739,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
     `Sitemap sources: ${robotsSitemaps.length} from robots.txt, ${configuredSitemapUrl ? "1" : "0"} user-provided`
   );
   pushLog(
-    `Sitemap discovery complete: ${sitemapResult.sitemapUrlsDiscovered.length} discovered, ${sitemapResult.sitemapUrlsParsed.length} parsed, ${sitemapPageUrls.length} sitemap URLs found`
+    `Sitemap discovery complete: ${sitemapResult.sitemapUrlsDiscovered.length} discovered, ${sitemapResult.sitemapUrlsParsed.length} parsed, ${crawlableSitemapPageUrls.length} crawlable sitemap URLs found`
   );
   if (sitemapNotConfigured) {
     const missingSitemapMessage =
@@ -612,7 +754,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
     }
     pushLog(`${missingSitemapMessage} Continuing with root URL + link discovery crawl.`, "WARN");
   }
-  if (sitemapPageUrls.length === 0) {
+  if (crawlableSitemapPageUrls.length === 0) {
     pushLog("No crawlable page URLs were discovered in sitemap sources.", "WARN");
   }
 
@@ -728,6 +870,10 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
                   return false;
                 }
 
+                if (!isLikelyHtmlPage(normalizedReqUrl)) {
+                  return false;
+                }
+
                 if (visitedUrls.has(normalizedReqUrl) || visitedUrls.size >= maxPages) {
                   return false;
                 }
@@ -790,6 +936,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
                   .map((href) => {
                     try {
                       const normalizedHref = normalizeCrawlUrl(href);
+                      if (!isLikelyHtmlPage(normalizedHref)) return null;
                       if (visitedUrls.has(normalizedHref) || visitedUrls.size >= maxPages) return null;
                       if (scheduledUrls.has(normalizedHref) || scheduledUrls.size >= maxPages) return null;
                       if (!robotsParser.isAllowed(normalizedHref)) return null;
@@ -964,7 +1111,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
       }));
 
     const sitemapComparable = new Set(
-      sitemapPageUrls.map((url) => normalizeComparableSiteUrl(url))
+      crawlableSitemapPageUrls.map((url) => normalizeComparableSiteUrl(url))
     );
     const crawledComparable = new Set(
       currentSnapshots.map((snapshot) => normalizeComparableSiteUrl(snapshot.url))
@@ -986,7 +1133,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
     // Store pages in database (parallelized with bounded concurrency).
     const crawlPageRows: Array<{ crawlId: string; pageId: string }> = [];
     let upsertIndex = 0;
-    const upsertWorkers = Math.min(PAGE_UPSERT_CONCURRENCY, extractedPages.length);
+    const upsertWorkers = Math.min(getPageUpsertConcurrency(), extractedPages.length);
 
     const upsertPageWorker = async (): Promise<void> => {
       while (upsertIndex < extractedPages.length) {
@@ -996,62 +1143,64 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
         if (!pageData) break;
 
         const now = new Date();
-        const page = await prisma.page.upsert({
-          where: {
-            projectId_url: {
+        const page = await withPrismaRetry(`Upserting page ${pageData.url}`, () =>
+          prisma.page.upsert({
+            where: {
+              projectId_url: {
+                projectId,
+                url: pageData.url,
+              },
+            },
+            create: {
               projectId,
               url: pageData.url,
+              canonicalUrl: pageData.canonicalUrl,
+              statusCode: pageData.statusCode,
+              responseTime: pageData.responseTime,
+              title: pageData.title,
+              metaDescription: pageData.metaDescription,
+              metaRobots: pageData.metaRobots,
+              h1: pageData.h1,
+              h2: pageData.h2,
+              h3: pageData.h3,
+              h4: pageData.h4,
+              h5: pageData.h5,
+              h6: pageData.h6,
+              ogTags: pageData.ogTags,
+              jsonLd: toInputJsonValue(pageData.jsonLd),
+              internalLinks: toInputJsonValue(pageData.internalLinks),
+              externalLinks: toInputJsonValue(pageData.externalLinks),
+              images: toInputJsonValue(pageData.images),
+              wordCount: pageData.wordCount,
+              hreflangTags: toInputJsonValue(pageData.hreflangTags),
+              pageSize: pageData.pageSize,
+              lastCrawledAt: now,
             },
-          },
-          create: {
-            projectId,
-            url: pageData.url,
-            canonicalUrl: pageData.canonicalUrl,
-            statusCode: pageData.statusCode,
-            responseTime: pageData.responseTime,
-            title: pageData.title,
-            metaDescription: pageData.metaDescription,
-            metaRobots: pageData.metaRobots,
-            h1: pageData.h1,
-            h2: pageData.h2,
-            h3: pageData.h3,
-            h4: pageData.h4,
-            h5: pageData.h5,
-            h6: pageData.h6,
-            ogTags: pageData.ogTags,
-            jsonLd: toInputJsonValue(pageData.jsonLd),
-            internalLinks: toInputJsonValue(pageData.internalLinks),
-            externalLinks: toInputJsonValue(pageData.externalLinks),
-            images: toInputJsonValue(pageData.images),
-            wordCount: pageData.wordCount,
-            hreflangTags: toInputJsonValue(pageData.hreflangTags),
-            pageSize: pageData.pageSize,
-            lastCrawledAt: now,
-          },
-          update: {
-            canonicalUrl: pageData.canonicalUrl,
-            statusCode: pageData.statusCode,
-            responseTime: pageData.responseTime,
-            title: pageData.title,
-            metaDescription: pageData.metaDescription,
-            metaRobots: pageData.metaRobots,
-            h1: pageData.h1,
-            h2: pageData.h2,
-            h3: pageData.h3,
-            h4: pageData.h4,
-            h5: pageData.h5,
-            h6: pageData.h6,
-            ogTags: pageData.ogTags,
-            jsonLd: toInputJsonValue(pageData.jsonLd),
-            internalLinks: toInputJsonValue(pageData.internalLinks),
-            externalLinks: toInputJsonValue(pageData.externalLinks),
-            images: toInputJsonValue(pageData.images),
-            wordCount: pageData.wordCount,
-            hreflangTags: toInputJsonValue(pageData.hreflangTags),
-            pageSize: pageData.pageSize,
-            lastCrawledAt: now,
-          },
-        });
+            update: {
+              canonicalUrl: pageData.canonicalUrl,
+              statusCode: pageData.statusCode,
+              responseTime: pageData.responseTime,
+              title: pageData.title,
+              metaDescription: pageData.metaDescription,
+              metaRobots: pageData.metaRobots,
+              h1: pageData.h1,
+              h2: pageData.h2,
+              h3: pageData.h3,
+              h4: pageData.h4,
+              h5: pageData.h5,
+              h6: pageData.h6,
+              ogTags: pageData.ogTags,
+              jsonLd: toInputJsonValue(pageData.jsonLd),
+              internalLinks: toInputJsonValue(pageData.internalLinks),
+              externalLinks: toInputJsonValue(pageData.externalLinks),
+              images: toInputJsonValue(pageData.images),
+              wordCount: pageData.wordCount,
+              hreflangTags: toInputJsonValue(pageData.hreflangTags),
+              pageSize: pageData.pageSize,
+              lastCrawledAt: now,
+            },
+          })
+        );
 
         crawlPageRows.push({ crawlId: crawl.id, pageId: page.id });
       }
@@ -1062,10 +1211,12 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
     }
 
     if (crawlPageRows.length > 0) {
-      await prisma.crawlPage.createMany({
-        data: crawlPageRows,
-        skipDuplicates: true,
-      });
+      await withPrismaRetry(`Creating crawl-page rows for ${crawl.id}`, () =>
+        prisma.crawlPage.createMany({
+          data: crawlPageRows,
+          skipDuplicates: true,
+        })
+      );
     }
 
     await syncCoverageIssue({
@@ -1132,7 +1283,7 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
         discoveredSitemaps: sitemapResult.sitemapUrlsDiscovered,
         parsedSitemaps: sitemapResult.sitemapUrlsParsed,
         sitemapErrors: sitemapResult.errors,
-        sitemapUrlCount: sitemapPageUrls.length,
+        sitemapUrlCount: crawlableSitemapPageUrls.length,
       },
       coverage: {
         hasSitemapCoverageBaseline,
@@ -1169,19 +1320,21 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
     };
 
     // Update crawl record
-    await prisma.crawl.update({
-      where: { id: crawl.id },
-      data: {
-        status: "COMPLETED",
-        completedAt: new Date(),
-        totalPages: extractedPages.length,
-        newPages: diff.newPages.length,
-        removedPages: diff.removedPages.length,
-        changedPages: changedUrlSet.size,
-        errorCount,
-        diff: toInputJsonValue(crawlDiagnostics),
-      },
-    });
+    await withPrismaRetry(`Marking crawl ${crawl.id} completed`, () =>
+      prisma.crawl.update({
+        where: { id: crawl.id },
+        data: {
+          status: "COMPLETED",
+          completedAt: new Date(),
+          totalPages: extractedPages.length,
+          newPages: diff.newPages.length,
+          removedPages: diff.removedPages.length,
+          changedPages: changedUrlSet.size,
+          errorCount,
+          diff: toInputJsonValue(crawlDiagnostics),
+        },
+      })
+    );
     crawlPhase = "completed";
     pushLog(
       `Crawl completed: pages=${extractedPages.length}, new=${diff.newPages.length}, removed=${diff.removedPages.length}, changed=${changedUrlSet.size}`
@@ -1189,15 +1342,19 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
 
     // Keep project in CRAWLING while downstream pipeline (audit/keywords/graph/agents) runs.
     // crawl-worker will mark ACTIVE when all post-crawl processing has completed.
-    const totalPages = await prisma.page.count({ where: { projectId } });
-    await prisma.project.update({
-      where: { id: projectId },
-      data: {
-        status: "CRAWLING",
-        lastCrawlAt: new Date(),
-        totalPages,
-      },
-    });
+    const totalPages = await withPrismaRetry(`Counting pages for ${projectId}`, () =>
+      prisma.page.count({ where: { projectId } })
+    );
+    await withPrismaRetry(`Updating project ${projectId} crawl totals`, () =>
+      prisma.project.update({
+        where: { id: projectId },
+        data: {
+          status: "CRAWLING",
+          lastCrawlAt: new Date(),
+          totalPages,
+        },
+      })
+    );
 
     await enqueueCrawlNotification({
       type: "CRAWL_COMPLETED",
@@ -1225,46 +1382,50 @@ export async function runCrawl(options: CrawlOptions): Promise<string> {
       });
     }
 
-    await prisma.crawl.update({
-      where: { id: crawl.id },
-      data: {
-        status: "FAILED",
-        errorMessage,
-        errorCount,
-        completedAt: new Date(),
-        diff: toInputJsonValue({
-          mode: "robots-and-user-sitemap-seeded-link-discovery",
-          robots: {
-            url: robotsParser.getRobotsUrl(),
-            found: robotsParser.hasRobotsTxt(),
-            fetchError: robotsParser.getFetchError(),
-          },
-          sitemap: {
-            sourceSummary: sitemapResult.sourceSummary,
-            userProvidedSitemap: configuredSitemapUrl,
-            missingSitemapConfiguration: sitemapNotConfigured,
-            discoveredSitemaps: sitemapResult.sitemapUrlsDiscovered,
-            parsedSitemaps: sitemapResult.sitemapUrlsParsed,
-            sitemapErrors: sitemapResult.errors,
-          },
-          failureDetails,
-          logs: crawlLogs.slice(-MAX_LIVE_LOG_LINES_IN_DB),
-          live: {
-            phase: "failed",
-            visitedUrls: visitedUrls.size,
-            extractedPages: extractedPages.length,
-            errorCount,
+    await withPrismaRetry(`Marking crawl ${crawl.id} failed`, () =>
+      prisma.crawl.update({
+        where: { id: crawl.id },
+        data: {
+          status: "FAILED",
+          errorMessage,
+          errorCount,
+          completedAt: new Date(),
+          diff: toInputJsonValue({
+            mode: "robots-and-user-sitemap-seeded-link-discovery",
+            robots: {
+              url: robotsParser.getRobotsUrl(),
+              found: robotsParser.hasRobotsTxt(),
+              fetchError: robotsParser.getFetchError(),
+            },
+            sitemap: {
+              sourceSummary: sitemapResult.sourceSummary,
+              userProvidedSitemap: configuredSitemapUrl,
+              missingSitemapConfiguration: sitemapNotConfigured,
+              discoveredSitemaps: sitemapResult.sitemapUrlsDiscovered,
+              parsedSitemaps: sitemapResult.sitemapUrlsParsed,
+              sitemapErrors: sitemapResult.errors,
+            },
+            failureDetails,
             logs: crawlLogs.slice(-MAX_LIVE_LOG_LINES_IN_DB),
-            updatedAt: new Date().toISOString(),
-          },
-        }),
-      },
-    });
+            live: {
+              phase: "failed",
+              visitedUrls: visitedUrls.size,
+              extractedPages: extractedPages.length,
+              errorCount,
+              logs: crawlLogs.slice(-MAX_LIVE_LOG_LINES_IN_DB),
+              updatedAt: new Date().toISOString(),
+            },
+          }),
+        },
+      })
+    );
 
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { status: "ERROR" },
-    });
+    await withPrismaRetry(`Updating project ${projectId} status to ERROR`, () =>
+      prisma.project.update({
+        where: { id: projectId },
+        data: { status: "ERROR" },
+      })
+    );
 
     await enqueueCrawlNotification({
       type: "CRAWL_FAILED",
