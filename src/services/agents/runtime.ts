@@ -113,7 +113,6 @@ async function loadLatestCrawlDelta(projectId: string): Promise<ProjectContext["
         firstDetectedAt: true,
       },
       orderBy: [{ severity: "desc" }, { firstDetectedAt: "desc" }],
-      take: 100,
     }),
     prisma.issue.findMany({
       where: {
@@ -131,7 +130,6 @@ async function loadLatestCrawlDelta(projectId: string): Promise<ProjectContext["
         resolvedAt: true,
       },
       orderBy: [{ severity: "desc" }, { resolvedAt: "desc" }],
-      take: 100,
     }),
     prisma.issue.findMany({
       where: {
@@ -151,7 +149,6 @@ async function loadLatestCrawlDelta(projectId: string): Promise<ProjectContext["
         lastDetectedAt: true,
       },
       orderBy: [{ severity: "desc" }, { lastDetectedAt: "desc" }],
-      take: 100,
     }),
   ]);
 

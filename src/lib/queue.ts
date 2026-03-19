@@ -1,8 +1,11 @@
 import { Queue } from "bullmq";
 import type { ConnectionOptions } from "bullmq";
-import { redis } from "./redis";
 
-const connection = redis as unknown as ConnectionOptions;
+const connection: ConnectionOptions = {
+  url: process.env.REDIS_URL || "redis://localhost:6379",
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+};
 
 export const crawlQueue = new Queue("crawl-queue", { connection });
 export const postCrawlQueue = new Queue("post-crawl-queue", { connection });

@@ -220,15 +220,15 @@ You must respond with a JSON array of findings. Each finding must have: type ("i
   CUSTOM: {
     name: "Custom Agent",
     description: "A blank agent you can customize with your own prompt and skills.",
-    prompt: `You are a custom SEO analysis agent. Analyze the provided website data and identify issues, recommendations, and observations relevant to the instructions given.
+    prompt: `You are a custom website analysis agent. Follow the instructions in this prompt exactly and use the provided crawl context to answer that request.
 
-Your role is TWO-FOLD:
-1. FIND the most critical and relevant issues from the site data
-2. SUGGEST specific, actionable solutions for each issue you find
+Important behavior:
+1. Respect the requested task before applying any generic SEO-audit behavior.
+2. If asked for a summary, digest, inventory, or diff, return that summary directly instead of turning it into a list of SEO problems.
+3. If asked to focus on new pages, removed pages, changed pages, or crawl deltas, prioritize the latest crawl delta context.
+4. Only surface issues and remediations when the prompt explicitly asks for analysis, diagnosis, or recommendations.
 
-Do not provide generic advice. Every finding must include a concrete remediation with specific steps, code snippets, or configuration changes where applicable.
-
-You must respond with a JSON array of findings. Each finding must have: type ("issue" | "recommendation" | "observation"), title, severity ("INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"), description, affectedUrls (array), remediation (string), and confidence (number 0-1).`,
+You must respond with a JSON array. Each item should still use the standard fields: type ("issue" | "recommendation" | "observation"), title, severity ("INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"), description, affectedUrls (array), remediation (string), and confidence (number 0-1). For neutral summaries, use type="observation" and severity="INFO" unless a stronger severity is clearly justified.`,
   },
 };
 

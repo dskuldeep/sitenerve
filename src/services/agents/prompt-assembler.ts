@@ -3,6 +3,48 @@ import {
   type AgentContextConfig,
 } from "@/types/agents";
 
+function summarizeJsonLdTypes(jsonLd: unknown[] | null): string[] {
+  if (!Array.isArray(jsonLd)) return [];
+
+  const types = new Set<string>();
+
+  for (const entry of jsonLd) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const typeValue = record["@type"];
+
+    if (typeof typeValue === "string" && typeValue.trim()) {
+      types.add(typeValue.trim());
+      continue;
+    }
+
+    if (Array.isArray(typeValue)) {
+      for (const nestedType of typeValue) {
+        if (typeof nestedType === "string" && nestedType.trim()) {
+          types.add(nestedType.trim());
+        }
+      }
+    }
+  }
+
+  return Array.from(types);
+}
+
+function summarizeEvidence(evidence: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (!evidence) return null;
+
+  const keys = Object.keys(evidence);
+  if (keys.length === 0) return null;
+
+  return {
+    keys,
+    sample:
+      keys.length > 0
+        ? Object.fromEntries(keys.slice(0, 5).map((key) => [key, evidence[key] ?? null]))
+        : null,
+  };
+}
+
 export interface ProjectContext {
   projectId: string;
   siteUrl: string;
@@ -148,29 +190,25 @@ export function buildPromptSections(config: {
     available: true,
   });
 
-  const maxPages = 200;
-  const pagesToInclude = context.pages.slice(0, maxPages);
   sections.push({
     key: "page-data",
-    title: `Page Data (${pagesToInclude.length} of ${context.pages.length} pages)`,
-    description: "Per-page crawl data, truncated for token budget control.",
+    title: `Page Data (${context.pages.length} pages)`,
+    description: "Per-page crawl data for the full crawl, slimmed to essential fields instead of truncating page count.",
     content:
       "```json\n" +
       JSON.stringify(
-        pagesToInclude.map((p) => ({
+        context.pages.map((p) => ({
           url: p.url,
           status: p.statusCode,
           title: p.title,
-          metaDescription: p.metaDescription
-            ? p.metaDescription.substring(0, 200)
-            : null,
+          metaDescription: p.metaDescription,
           h1: p.h1,
           wordCount: p.wordCount,
           responseTime: p.responseTime,
           pageSize: p.pageSize,
           canonicalUrl: p.canonicalUrl,
           metaRobots: p.metaRobots,
-          jsonLd: p.jsonLd,
+          jsonLdTypes: summarizeJsonLdTypes(p.jsonLd),
           internalLinkCount: p.internalLinks?.length ?? 0,
           externalLinkCount: p.externalLinks?.length ?? 0,
           imageCount: p.images?.length ?? 0,
@@ -192,13 +230,11 @@ export function buildPromptSections(config: {
       return acc;
     }, {});
 
-    const issuesToInclude = context.issues.slice(0, 500);
-
     sections.push({
       key: "existing-issues",
-      title: `Full Site Audit Context (${issuesToInclude.length} of ${context.issues.length})`,
+      title: `Full Site Audit Context (${context.issues.length} issues)`,
       description:
-        "Deterministic audit findings passed as baseline evidence to avoid duplicate analysis.",
+        "Full deterministic audit baseline, compacted by slimming each issue record rather than truncating issue count.",
       content:
         `The deterministic audit detected ${context.issues.length} active issues across the site.\n\n` +
         "### Audit Summary by Category/Severity\n" +
@@ -206,9 +242,21 @@ export function buildPromptSections(config: {
         JSON.stringify(issueSummary, null, 2) +
         "\n```\n\n" +
         "### Audit Findings\n" +
-        "Use this as baseline evidence. Your output should add prioritization, root-cause patterns, and implementation-ready remediations.\n\n" +
+        "Use this as supporting context when relevant to the agent instructions. Do not default to issue-hunting if the instructions ask for a summary, inventory, or page-diff report.\n\n" +
         "```json\n" +
-        JSON.stringify(issuesToInclude, null, 2) +
+        JSON.stringify(
+          context.issues.map((issue) => ({
+            ruleId: issue.ruleId,
+            category: issue.category,
+            severity: issue.severity,
+            title: issue.title,
+            description: issue.description,
+            affectedUrl: issue.affectedUrl,
+            evidenceSummary: summarizeEvidence(issue.evidence),
+          })),
+          null,
+          2
+        ) +
         "\n```",
       included: contextConfig.includeExistingIssues,
       available: true,
@@ -242,7 +290,7 @@ export function buildPromptSections(config: {
       ? "Latest Crawl Delta (Initial Baseline)"
       : "Latest Crawl Delta",
     description: context.latestCrawlDelta.available
-      ? "Net URL and issue changes from the most recent completed crawl."
+      ? "Net URL and issue changes from the most recent completed crawl. Use this first for prompts about new pages, removed pages, or change summaries."
       : "No completed crawl is available yet, so there is no crawl delta context to inject.",
     content: context.latestCrawlDelta.available
       ? "```json\n" + JSON.stringify(context.latestCrawlDelta, null, 2) + "\n```"
@@ -260,36 +308,38 @@ export function buildPromptSections(config: {
   sections.push({
     key: "output-format",
     title: "Output Format",
-    description: "Structured JSON contract and quality bar enforced for every run.",
+    description: "Structured JSON contract that should follow the agent instructions rather than forcing a single SEO-audit style.",
     content:
       "You MUST respond with ONLY a valid JSON array. Do not include any text before or after the JSON.\n\n" +
       "Each element in the array must be an object with these fields:\n" +
       '- `type` (string): One of "issue", "recommendation", or "observation"\n' +
       "- `title` (string): A concise, actionable title\n" +
       '- `severity` (string): One of "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"\n' +
-      "- `description` (string): Detailed explanation with evidence from the data\n" +
+      "- `description` (string): The main content. This may be a detailed explanation, a summary, an inventory, or a change report depending on the instructions.\n" +
       "- `affectedUrls` (string[]): Array of affected page URLs\n" +
-      "- `remediation` (string): SPECIFIC, ACTIONABLE solution — include exact HTML, config, or code where applicable. Not generic advice.\n" +
+      "- `remediation` (string): Optional next step, action, or implementation guidance when relevant. Leave it concise when the prompt asks for a report rather than a fix.\n" +
       "- `confidence` (number): Your confidence in this finding, 0.0 to 1.0\n\n" +
+      "INSTRUCTION PRIORITY:\n" +
+      "- Follow the agent instructions first.\n" +
+      "- If the prompt asks for a summary, inventory, diff, or digest, respond with `observation` items instead of forcing everything into SEO issues.\n" +
+      "- If the prompt asks specifically about new pages, removed pages, or crawl deltas, prioritize the `Latest Crawl Delta` section over generic site-wide issue patterns.\n" +
+      "- Only produce SEO issues and remediations when the instructions ask for analysis or problem-finding.\n\n" +
       "QUALITY BAR:\n" +
-      "- Your analysis must reference concrete site data (status codes, canonical targets, metadata values, JSON-LD fields, link targets).\n" +
-      "- Group duplicate symptoms into root causes and explain why they happen.\n" +
-      "- Prioritize by business impact first (indexation/crawl blockers before cosmetics).\n\n" +
-      "IMPORTANT: Your remediation must be specific enough that a developer can implement it without further research. " +
-      "For meta tag issues, suggest the exact text. For schema issues, provide the JSON-LD snippet. " +
-      "For configuration issues, provide the exact directive.\n\n" +
+      "- Reference concrete data from the provided context.\n" +
+      "- Stay aligned with the user's requested task instead of defaulting to a standard audit.\n" +
+      "- When summarizing, favor coverage and clarity over remediation depth.\n\n" +
       "Example:\n" +
       "```json\n" +
       JSON.stringify(
         [
           {
-            type: "issue",
-            title: "Multiple pages competing for the same keyword",
-            severity: "MEDIUM",
-            description: "Pages /about and /about-us have nearly identical title tags and target the same 'about company' intent.",
-            affectedUrls: ["/about", "/about-us"],
-            remediation: "301 redirect /about-us to /about. Add the following to your server config:\n\nRewriteRule ^/about-us$ /about [R=301,L]\n\nThen consolidate the unique content from /about-us into the /about page.",
-            confidence: 0.85,
+            type: "observation",
+            title: "18 new pages were detected in the latest crawl",
+            severity: "INFO",
+            description: "Most new URLs are under /docs/integrations and /docs/api. No removed pages were detected in the same crawl window.",
+            affectedUrls: ["/docs/integrations/example-a", "/docs/api/example-b"],
+            remediation: "Review the new pages for indexability, internal linking, and sitemap inclusion if you want a follow-up audit.",
+            confidence: 0.94,
           },
         ],
         null,

@@ -6,10 +6,20 @@ const globalForRedis = globalThis as unknown as {
 
 function createRedisClient(): IORedis {
   const url = process.env.REDIS_URL || "redis://localhost:6379";
-  return new IORedis(url, {
+  const client = new IORedis(url, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
+    lazyConnect: true,
   });
+
+  client.on("error", (error) => {
+    console.warn(
+      "[Redis] Connection error:",
+      error instanceof Error ? error.message : String(error)
+    );
+  });
+
+  return client;
 }
 
 export const redis = globalForRedis.redis ?? createRedisClient();
